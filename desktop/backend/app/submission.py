@@ -2074,10 +2074,17 @@ def build_submission_resource_name(metadata: Dict[str, Any], file_names: Iterabl
     seen = set()
     for item in details:
         clean = re.sub(r"\s+", " ", str(item or "")).strip()
-        key = clean.upper()
-        if clean and key not in seen:
-            seen.add(key)
-            unique.append(clean)
+        if not clean:
+            continue
+        # 去重按「词」而不是整串：油猴直投 meta 的 effect 是「DV + 动态范围 + 高规格
+        # (highQuality) + 3D」的合并值，本来就含 HQ/EDR 这些词；整串比对时「HQ」与
+        # 「DV HQ」不相等，同一个 HQ 会被 highQuality 与 effect 各写一遍（HQ DV HQ）。
+        tokens = [token for token in re.split(r"[\s/]+", clean) if token]
+        fresh = [token for token in tokens if token.upper() not in seen]
+        if not fresh:
+            continue
+        seen.update(token.upper() for token in fresh)
+        unique.append(" ".join(fresh))
     if metadata.get("releaseGroup"):
         unique.append(f"[{metadata['releaseGroup']}]")
     return " ".join(unique).strip()

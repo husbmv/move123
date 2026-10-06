@@ -37,6 +37,7 @@ from app.submission import (
     submission_publication_message_ids,
     build_submission_resource_name,
     recognize_submission_metadata,
+    apply_submission_meta_overrides,
     summarize_season_episodes,
     render_submission_caption,
     send_telegram_rich_message,
@@ -737,6 +738,39 @@ class SubmissionDraftTests(unittest.TestCase):
         self.assertIn("HDR10+", name)
         self.assertNotIn("HDR10 HDR", name)
         self.assertNotIn("HDR10 HDR10", name)
+
+    def test_submission_resource_name_dedups_high_quality_inside_effect(self):
+        """脚本直投 meta 的 effect 汇总里已含 HQ，资源行不应再写一遍（回归：HQ DV HQ）。"""
+        files = [
+            "Show.2026.S01E01.2160p.WEB-DL.YOUKU.HQ.DV.60fps.H265.AAC.2.0.mkv",
+            "Show.2026.S01E02.2160p.WEB-DL.YOUKU.HQ.DV.60fps.H265.AAC.2.0.mkv",
+        ]
+        metadata = recognize_submission_metadata("", {"fileNames": files}, {})
+        # 油猴秒传直投带过来的 effect 是合并值（DV + 高规格），客户端 highQuality 另算一份
+        metadata = apply_submission_meta_overrides(metadata, {"effect": "DV HQ"})
+        self.assertEqual(metadata["highQuality"], "HQ")
+        name = build_submission_resource_name(metadata, files, {})
+        self.assertEqual(name.upper().count("HQ"), 1)
+        self.assertIn("DV", name)
+        self.assertNotIn("HQ DV HQ", name)
+
+    def test_submission_resource_name_dedups_edr_inside_effect(self):
+        """EDR 走独立槽位、effect 里也可能带 EDR，同样不能写两遍。"""
+        files = ["Show.2026.S01E01.2160p.WEB-DL.EDR.60fps.H265.AAC.2.0.mkv"]
+        metadata = recognize_submission_metadata("", {"fileNames": files}, {})
+        metadata = apply_submission_meta_overrides(metadata, {"effect": "DV EDR"})
+        name = build_submission_resource_name(metadata, files, {})
+        self.assertEqual(name.upper().count("EDR"), 1)
+
+    def test_submission_resource_name_keeps_multi_word_values_in_order(self):
+        """逐词去重不能打乱或丢掉多词字段（HDR.Vivid / UHD BluRay Remux 这类）。"""
+        files = ["Show.2026.S01E01.2160p.UHD.BluRay.Remux.HDR.Vivid.H265.DTS-HD.MA.5.1-Group.mkv"]
+        metadata = recognize_submission_metadata("", {"fileNames": files}, {})
+        name = build_submission_resource_name(metadata, files, {})
+        self.assertIn("UHD BluRay Remux", name)
+        self.assertIn("HDR.Vivid", name)
+        self.assertEqual(name.upper().count("HDR"), 1)
+        self.assertEqual(name.upper().count("REMUX"), 1)
 
     def test_fastlink_copy_text_button_only_within_telegram_limit(self):
         """超过 copy_text 256 字符上限的多文件秒传链接不应生成复制按钮。"""
