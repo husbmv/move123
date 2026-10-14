@@ -686,3 +686,94 @@ test("文件级覆盖优先级最高：单文件纠正文件名写错的标记",
   assert.ok(!group.files[0].newName.includes("HDR10"), `新文件名不应再出现 HDR10：${group.files[0].newName}`);
   assert.ok(group.files[0].newName.includes("DV"), `新文件名应带上单文件覆盖的 DV：${group.files[0].newName}`);
 });
+
+// —— 同目录多续作（英文片名结尾序号）：Aces Go Places 1-5 不再塌缩成第一部 ——
+// 用户报告：5 部片放同一个文件夹整理，全被整理成第一部「最佳拍档」。根因是散文件
+// 分组的 looseGroupBaseTitleForFile 只保护「中文紧贴数字」的续作号（叶问2），英文的
+// 「Aces Go Places 2」结尾序号被 stripLooseEpisodeTail 当集号剥掉，五部共用一个
+// 分组键 → 整组只认一部 TMDB 条目 → 续作全被改名成第一部。
+const ACES_FILES = [
+  "Aces.Go.Places.5.1989.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.mkv",
+  "Aces.Go.Places.2.1983.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.nfo",
+  "Aces.Go.Places.3.1984.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.mkv",
+  "Aces.Go.Places.3.1984.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.nfo",
+  "Aces.Go.Places.4.1986.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.mkv",
+  "Aces.Go.Places.4.1986.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.nfo",
+  "Aces.Go.Places.2.1983.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.mkv",
+  "Aces.Go.Places.5.1989.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.nfo",
+  "Aces.Go.Places.1982.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.mkv",
+  "Aces.Go.Places.1982.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.nfo"
+];
+const ACES_TITLES = ["Aces Go Places", "Aces Go Places 2", "Aces Go Places 3", "Aces Go Places 4", "Aces Go Places 5"];
+
+test("英文续作结尾序号紧贴年份时保留，同目录五部续作各成一组", () => {
+  const groups = buildLooseGroups(
+    ACES_FILES.map((name, index) => formFile(name, `aces${index}`, { sourceFolderId: "aces-folder", sourceFolderName: "最佳拍档合集" })),
+    config
+  );
+  assert.equal(groups.length, 5, `五部续作应各成一组，实际 ${groups.length} 组：${groups.map((group) => group.title).join(" / ")}`);
+  const titles = groups.map((group) => group.title);
+  for (const title of ACES_TITLES) assert.ok(titles.includes(title), `缺少分组「${title}」：${titles.join(" / ")}`);
+  // 年份跟着各自的组走（修复前整组只剩一个年份）
+  const years = groups.map((group) => inferFields(group.title, group.files.map((file) => file.name), config.library).year).sort();
+  assert.equal(years.join(" / "), "1982 / 1983 / 1984 / 1986 / 1989", `各续作年份应各归各组，实际 ${years.join(" / ")}`);
+});
+
+test("目录名带年份但里面是多部不同年份的影片时，不再整目录并成一部", () => {
+  const mk = (index, name) => formFile(name, `acesf${index}`, { sourceFolderId: "aces-year-folder", sourceFolderName: "Aces Go Places 1982" });
+  const groups = buildLooseGroups([
+    mk(0, ACES_FILES[8]),
+    mk(1, ACES_FILES[6]),
+    mk(2, ACES_FILES[2]),
+    mk(3, ACES_FILES[4]),
+    mk(4, ACES_FILES[0])
+  ], config);
+  assert.equal(groups.length, 5, `带年份目录里的多部影片应各成一组，实际 ${groups.length} 组：${groups.map((group) => group.title).join(" / ")}`);
+  const titles = groups.map((group) => group.title);
+  for (const title of ACES_TITLES) assert.ok(titles.includes(title), `缺少分组「${title}」：${titles.join(" / ")}`);
+});
+
+test("整理根目录名带年份、内含多部不同年份影片时按文件名各自成组", async () => {
+  const tree = { root: ACES_FILES.map((name, index) => mkFile(`acesr${index}`, name, 100)) };
+  const api = { listAll: async (id) => tree[id] || [] };
+  const groups = await collectOrganizeGroups(api, [{ id: "root", name: "Aces Go Places 1982", type: 1 }], config, { tmdb: { search: async () => [] } });
+  assert.equal(groups.length, 5, `整理根目录名带年份时也应拆成 5 组，实际 ${groups.length} 组：${groups.map((group) => group.title).join(" / ")}`);
+  assert.ok(!groups.some((group) => group.id.startsWith("folder:")), "不能再整目录并成 folder: 一组");
+});
+
+test("回归：单部影片的年份目录仍整目录一组", async () => {
+  const tree = {
+    root: [
+      mkFile("sm1", "Some.Movie.2020.2160p.WEB-DL.H265.mkv", 100),
+      mkFile("sm2", "Some.Movie.2020.2160p.WEB-DL.H265.nfo", 5)
+    ]
+  };
+  const api = { listAll: async (id) => tree[id] || [] };
+  const groups = await collectOrganizeGroups(api, [{ id: "root", name: "Some Movie 2020", type: 1 }], config, { tmdb: { search: async () => [] } });
+  assert.equal(groups.length, 1, `单部影片目录应仍为一组，实际 ${groups.length} 组`);
+  assert.equal(groups[0].files.length, 2, "侧车文件跟随同一组");
+});
+
+test("回归：集号的年份写在序号之前，结尾序号仍按集号剥（剧集不拆组）", () => {
+  const groups = buildLooseGroups([
+    formFile("Show.Name.2020.01.1080p.WEB-DL.mkv", "ep1", { sourceFolderId: "ep-folder", sourceFolderName: "Show Name" }),
+    formFile("Show.Name.2020.02.1080p.WEB-DL.mkv", "ep2", { sourceFolderId: "ep-folder", sourceFolderName: "Show Name" })
+  ], config);
+  assert.equal(groups.length, 1, `剧集各集应仍为一组，实际 ${groups.length} 组：${groups.map((group) => group.title).join(" / ")}`);
+  assert.equal(groups[0].title, "Show Name");
+});
+
+test("回归：补零序号仍按集号剥（05 是集号写法，不像续作号）", () => {
+  const groups = buildLooseGroups([
+    formFile("Show.Name.05.2020.1080p.mkv", "zp1"),
+    formFile("Show.Name.06.2020.1080p.mkv", "zp2")
+  ], config);
+  assert.equal(groups.length, 1, `补零序号不应被当成续作号拆组，实际 ${groups.length} 组：${groups.map((group) => group.title).join(" / ")}`);
+});
+
+test("组级发布组不被 .nfo 侧车污染（优先取视频文件）", () => {
+  const nfo = "Aces.Go.Places.2.1983.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.nfo";
+  const mkv = "Aces.Go.Places.2.1983.2160p.UHD.Blu-ray.REMUX.HEVC.DTS-HD.MA2.0-HDH.mkv";
+  assert.equal(inferFields("Aces Go Places 2", [nfo, mkv], config.library).releaseGroup, "HDH", "侧车在前时组级发布组仍取视频文件");
+  assert.equal(inferFields("Aces Go Places 2", [mkv, nfo], config.library).releaseGroup, "HDH");
+});

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.4.8
+// @version      1.4.10
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -2952,6 +2952,21 @@
   // 走 findFixedMapping → normalizeFixedMappings，此前每次都整表重建 100+ 条映射。
   // 配置数组在两次预览之间是同一引用；设置草稿走 structuredClone，UI 编辑不会污染缓存。
   var NORMALIZED_FIXED_MAPPINGS_CACHE = new WeakMap();
+  // SDR 是默认档位，PT 命名惯例一律不标注（维护者 2026-10-04 定，与鸿蒙工程口径一致）：
+  // 动态范围组里的 SDR 别名与 SDR 输出都剥掉，整条只剩 SDR 的映射直接丢掉。
+  // 为什么闸放在归一化而不是只从 DEFAULT_FIXED_MAPPINGS 删条目：fixedMappings 是**首装快照**，
+  // 1.4.7 及更早版本已经把 dynamic-sdr 条目种进了用户配置，只删默认表存量用户永远拿不到
+  // （AVS2/AVS3 那次就是靠 schemaVersion 迁移补的）。归一化处在每条识别路径的必经之处
+  // （配置装载、整理预览、秒传直投 meta），存量快照在这里就被剥干净，不用再加一次版本迁移。
+  // 只动 dynamicRange：「VIVID SDR」是「高规格/EDR」的别名，不属于动态范围档位，不能碰。
+  var SDR_ONLY_ALIAS = /^SDR$/;
+  var sdrKey = (value) => String(value || "").replace(/[\s._-]+/g, "").toUpperCase();
+  function stripSdrDynamicRange(item) {
+    if (item.field !== "dynamicRange") return item;
+    const aliases = item.aliases.filter((alias) => !SDR_ONLY_ALIAS.test(sdrKey(alias)));
+    if (!aliases.length || SDR_ONLY_ALIAS.test(sdrKey(item.output))) return null;
+    return { ...item, aliases };
+  }
   function normalizeFixedMappings(value) {
     const source = value === void 0 ? DEFAULT_FIXED_MAPPINGS : value;
     if (!Array.isArray(source)) return [];
@@ -2967,7 +2982,7 @@
         aliases: [...new Set(aliases)],
         output
       };
-    }).filter((item) => item.aliases.length && item.output);
+    }).map(stripSdrDynamicRange).filter((item) => item && item.aliases.length && item.output);
     NORMALIZED_FIXED_MAPPINGS_CACHE.set(source, normalized);
     return normalized;
   }
@@ -6930,8 +6945,27 @@
   // 安装/升级后首次加载自动弹一次最新版本的更新说明，点「我已知晓」记下已读版本，已读不再弹；
   // 没有常驻菜单入口（维护者 2026-09-17：撤掉「查看 123 助手更新内容」菜单）。
   // 头部条目版本必须与脚本 @version 一致（回归测试 changelog-notice.test.mjs 会盯着这条）。
+  // 写法（维护者 2026-10-13 定）：一个功能或优化一行、小白话——只写用户看得见的变化，
+  // 一行一件事且一眼看完（≤40 字），不写字段名/函数名/属性名/文件名这类实现细节；
+  // 历史版本条目不用回改（弹窗只按当前版本号取对应那一版）。机检在 changelog-notice.test.mjs。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.4.10",
+      notes: [
+        "整理后的文件名里不再出现 SDR，以前配置里的残留也会自动清掉",
+        "多选生成二级链接时每个项目各一条短链、各建一条投稿草稿"
+      ]
+    },
+    {
+      version: "1.4.9",
+      notes: [
+        "同一个文件夹里放多部同系列电影时不再全被整理成第一部，续作各认各的",
+        "英文片名结尾的续作序号（Aces Go Places 2、Shrek 2、Ocean's 11）不再被当成集数剥掉",
+        "文件夹名带年份但里面是多部不同年份的影片时，按各自的文件名识别，不再整目录认成一部",
+        "整理预览里的发布组不再被同名的 .nfo 字幕文件带偏"
+      ]
+    },
     {
       version: "1.4.8",
       notes: [
@@ -9691,28 +9725,58 @@
     return { fileName: `${folderName}${date}.123fastlink.${useJson ? "json" : "txt"}`, useJson };
   }
   async function generateSecondaryFastlink(api, items, options = {}) {
-    if (!Array.isArray(items) || !items.length) throw new Error("\u8BF7\u5148\u9009\u62E9\u8981\u751F\u6210\u4E8C\u7EA7\u79D2\u4F20\u7684\u6587\u4EF6\u6216\u6587\u4EF6\u5939");
-    options.onProgress?.(0, 2, "\u626B\u63CF\u79D2\u4F20\u6587\u4EF6");
-    const files = await collectFastlinkFiles(api, items, {
-      signal: options.signal,
-      filterEnabled: options.filterEnabled,
-      filterExtensions: options.filterExtensions,
-      onProgress: (done) => options.onProgress?.(0, 2, `\u5DF2\u626B\u63CF ${done} \u4E2A\u6587\u4EF6`),
-      onDetail: options.onDetail,
-      checkpoint: options.checkpoint || null,
-      checkpointRoots: items.map((item, index) => index)
-    });
-    const { fileName, useJson } = buildSecondarySeedName(items, options);
-    const strippedReleaseGroups = options.stripReleaseGroup ? collectFastlinkReleaseGroups(files, options.releaseGroups) : "";
-    const content = useJson ? buildFastlinkJson(files, options) : buildFastlinkText(files, options);
+    if (!Array.isArray(items) || !items.length) throw new Error("请先选择要生成二级秒传的文件或文件夹");
+    const checkpoint = options.checkpoint || null;
+    // 阶段 1：逐顶层项目扫描（串行）。列举请求统一受 panApiGates.list 全局门控速（约 15 QPS/用户），
+    // 多项目并发扫描也不会更快——门才是瓶颈；串行还能共用一个扫描断点，与 exportFastlinkItems 同构。
+    const seeds = [];
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      options.onProgress?.(index, items.length, `扫描秒传文件：${item.name}`);
+      const files = await collectFastlinkFiles(api, [item], {
+        signal: options.signal,
+        filterEnabled: options.filterEnabled,
+        filterExtensions: options.filterExtensions,
+        onProgress: (done) => options.onProgress?.(index, items.length, `${item.name}：已扫描 ${done} 个文件`),
+        onDetail: options.onDetail,
+        checkpoint,
+        checkpointRoots: [index]
+      });
+      if (!files.length) throw new Error(`所选项目没有可导出的文件：${item.name}`);
+      // 单项目命名直接用项目名（buildSecondarySeedName 仅在 items.length === 1 时用文件夹名）
+      const { fileName, useJson } = buildSecondarySeedName([item], options);
+      const strippedReleaseGroups = options.stripReleaseGroup ? collectFastlinkReleaseGroups(files, options.releaseGroups) : "";
+      const content = useJson ? buildFastlinkJson(files, options) : buildFastlinkText(files, options);
+      seeds.push({ item, fileName, content, strippedReleaseGroups, fileCount: files.length });
+    }
+    // 阶段 2：种子上传并发跑（与分享链接 createShares 的 mapLimit 同一模式，按写并发）；
+    // mapLimit 按入参顺序回填结果，草稿顺序与勾选顺序一致。
     const parentId = normalizeSeedFolderId(options.seedFolderId) || String(options.currentDir || "0");
-    options.onProgress?.(1, 2, `\u4E0A\u4F20\u79CD\u5B50\u6587\u4EF6\uFF1A${fileName}`);
-    const seed = await api.uploadTextFile(fileName, content, parentId, options.signal);
-    const link = buildFastlinkText([{ name: fileName, fileName, etag: seed.etag, size: seed.size, path: fileName }], { ...options, stripReleaseGroup: false });
-    // 全链成功才清扫描断点（对齐 exportFastlinkItems）：不清的话下次打开面板还提示「继续/放弃上次扫描」
-    options.checkpoint?.clear();
-    options.onProgress?.(2, 2, "\u4E8C\u7EA7\u79D2\u4F20\u94FE\u63A5\u5DF2\u751F\u6210");
-    return { item: { name: fileName }, fileCount: files.length, filename: fileName, text: content, link, strippedReleaseGroups, seedFile: { id: seed.id, name: fileName, etag: seed.etag, size: seed.size } };
+    const uploadConcurrency = Math.max(1, Math.min(10, Number(options.concurrency) || 3));
+    const artifacts = await mapLimit(seeds, uploadConcurrency, async (seed) => {
+      const seedFile = await api.uploadTextFile(seed.fileName, seed.content, parentId, options.signal);
+      const link = buildFastlinkText([{ name: seed.fileName, fileName: seed.fileName, etag: seedFile.etag, size: seedFile.size, path: seed.fileName }], { ...options, stripReleaseGroup: false });
+      return {
+        item: seed.item,
+        fileCount: seed.fileCount,
+        filename: seed.fileName,
+        text: seed.content,
+        link,
+        strippedReleaseGroups: seed.strippedReleaseGroups,
+        seedFile: { id: seedFile.id, name: seed.fileName, etag: seedFile.etag, size: seedFile.size }
+      };
+    }, {
+      signal: options.signal,
+      onProgress: (completed) => options.onProgress?.(completed, items.length, `上传种子文件：${completed}/${items.length}`)
+    });
+    // 逐顶层项交付：按勾选顺序逐个交给调用方
+    for (let index = 0; index < artifacts.length; index += 1) {
+      if (options.onArtifact) await options.onArtifact(artifacts[index], index + 1, items.length);
+    }
+    // 全部项目的链接都成功才清扫描断点（对齐 exportFastlinkItems）：不清的话下次打开面板还提示「继续/放弃上次扫描」
+    checkpoint?.clear();
+    options.onProgress?.(items.length, items.length, "二级秒传链接已生成");
+    return artifacts;
   }
   async function saveSecondaryFastlink(api, value, rootId, options = {}) {
     const parsed = typeof value === "string" ? parseFastlink(value) : value;
@@ -19278,7 +19342,9 @@ ${end.comment}` : end.comment;
       mediaType,
       season: String(episode.season || 1),
       seasonEpisode: episode.seasonEpisode,
-      releaseGroup: preparedFiles.map((name) => extractReleaseGroup(name, config.recognition?.releaseGroups || [])).find(Boolean) || "",
+      // 组级发布组优先取视频文件：同组的 .nfo/.srt 侧车排在前面时，`-HDH.nfo` 会被
+      // 解析成发布组「nfo」，整组的发布组跟着变脏。视频文件都取不到才退回侧车。
+      releaseGroup: [...videoNames, ...preparedFiles].map((name) => extractReleaseGroup(name, config.recognition?.releaseGroups || [])).find(Boolean) || "",
       ...technical
     };
   }
@@ -20447,11 +20513,17 @@ ${end.comment}` : end.comment;
   // 文件名带年份时，标题结尾紧贴中文的数字是续作序号（怪物史瑞克2/叶问2），不是
   // 集数，不剥——剥了会让四部续作塌缩成第一部的同一个分组键。「标题02」这类没有
   // 年份佐证的仍按集数剥（原行为不变）。
+  // 英文片名同理（Aces Go Places 2.1983 / Shrek.2.2004 / Ocean's.11.2001）：结尾数字
+  // 紧挨着年份时是续作序号，保留；集号的年份写在序号之前（Show.2020.01），序号后面
+  // 接不上年份，不会被误留。补零写法（05）更像集号、不像续作号，仍按集数剥。
   function looseGroupBaseTitleForFile(title, text) {
-    const hasYear = /(?:^|[^0-9])(?:19|20)\d{2}(?:[^0-9]|$)/.test(String(text || ""));
-    if (hasYear && /[\u3400-\u9fff]\d{1,4}$/.test(String(title || "").trim())) {
-      const value = String(title || "").trim();
-      return value;
+    const source = String(text || "");
+    const value = String(title || "").trim();
+    const hasYear = /(?:^|[^0-9])(?:19|20)\d{2}(?:[^0-9]|$)/.test(source);
+    if (hasYear && /[\u3400-\u9fff]\d{1,4}$/.test(value)) return value;
+    if (hasYear) {
+      const tail = value.match(/(?:^|[\s._·-])(\d{1,2})$/);
+      if (tail && !/^0\d/.test(tail[1]) && new RegExp(`[\\s._·-]${tail[1]}[\\s._·-]*(?:19|20)\\d{2}(?:[^0-9]|$)`).test(source)) return value;
     }
     return looseGroupBaseTitle(title);
   }
@@ -20464,6 +20536,19 @@ ${end.comment}` : end.comment;
       if (matches) for (const value of matches) years.add(value);
     }
     return years;
+  }
+  // 「一目录一部影片」的目录里，所有文件只该指向同一部片。目录里出现两个以上不同
+  // 年份时（同一个文件夹塞了 Aces Go Places 2/3/4/5 这种同系列多续作），「一目录一部」
+  // 的假设不成立：整目录并成一组会把它们全认成第一部，续作全被改名。命中时退回散文件
+  // 分组，按各自文件名认各自的片。分辨率里的 2048p 之类不算年份（与识别段 YEAR 同口径）。
+  function folderSpansMultipleMovieYears(files) {
+    const years = /* @__PURE__ */ new Set();
+    for (const file of files || []) {
+      const matches = String(file?.name || "").match(/(?<!\d)(?:19|20)\d{2}(?!\d|p)/gi);
+      if (matches) for (const value of matches) years.add(value);
+      if (years.size > 1) return true;
+    }
+    return false;
   }
   function looseGroupKeyTitle(baseTitle, text) {
     const normalized = String(baseTitle || "").replace(/[\s._-]+/g, "").toLocaleLowerCase() || "unknown";
@@ -20577,6 +20662,21 @@ ${end.comment}` : end.comment;
     const grouped = /* @__PURE__ */ new Map();
     const customWords = config.library?.recognition?.customWords || [];
     const fixedMappings = config.library?.recognition?.fixedMappings;
+    // 同一个父目录里出现多部不同年份的影片时（同系列多续作塞一个文件夹），该目录不是
+    // 「一目录一部」，按目录并组会整目录认成第一部；先算出这类目录，下面按文件名各自归组。
+    const multiYearFolderIds = /* @__PURE__ */ new Set();
+    {
+      const filesByFolder = /* @__PURE__ */ new Map();
+      for (const file of loose) {
+        const folderId = String(file.sourceFolderId || "");
+        if (!folderId) continue;
+        if (!filesByFolder.has(folderId)) filesByFolder.set(folderId, []);
+        filesByFolder.get(folderId).push(file);
+      }
+      for (const [folderId, files] of filesByFolder) {
+        if (folderSpansMultipleMovieYears(files)) multiYearFolderIds.add(folderId);
+      }
+    }
     for (const file of loose) {
       const text2 = looseRecognitionText(file, customWords);
       const title = inferTitle(text2, fixedMappings);
@@ -20584,8 +20684,10 @@ ${end.comment}` : end.comment;
       // 年份、不含季词）时按目录并组，不按文件名标题归并——「怪物史瑞克/怪物史瑞克2/
       // 怪物史瑞克3/怪物史瑞克4」四个续作目录若按标题归并会塌缩成第一部的分组，
       // 续作全被改名成第一部的名字。季目录/无年份目录不适用（剧集仍按标题归组）。
+      // 目录里本身就有多部不同年份的影片时（multiYearFolderIds）也不算「一目录一部」。
       const subfolderName = String(file.sourceFolderName || "");
-      const subfolderTitle = subfolderName && !isWeakOrganizeFolderTitle(subfolderName, fixedMappings)
+      const subfolderTitle = subfolderName && !multiYearFolderIds.has(String(file.sourceFolderId || ""))
+        && !isWeakOrganizeFolderTitle(subfolderName, fixedMappings)
         && /(?:^|[^0-9])(?:19|20)\d{2}(?:[^0-9]|$)/.test(subfolderName)
         && seasonNumberFromText(subfolderName) === null
         ? cleanName(normalizedTitle(subfolderName)) || normalizedTitle(subfolderName)
@@ -20853,6 +20955,11 @@ ${end.comment}` : end.comment;
             if (!childFiles.length) continue;
             childFiles.forEach((file) => claimed.add(String(file.id)));
             if (!childFiles.some((file) => isVideoFile(file.name))) continue;
+            // 子目录里塞了多部不同年份的影片时不是「一目录一部」，落回散文件分组各认各的
+            if (folderSpansMultipleMovieYears(childFiles)) {
+              for (const file of childFiles) loose.push({ ...file, sourceFolders: scanned.sourceFolders });
+              continue;
+            }
             const validation = await validateStrongFolderTitle(options.tmdb, child.name, config, options);
             if (!validation.available || validation.media) {
               assignFileVariantLabels(childFiles, child.name, config);
@@ -20875,7 +20982,10 @@ ${end.comment}` : end.comment;
           continue;
         }
         const targetSeason = targetSeasonFromFolder(item.name);
-        if (!isWeakOrganizeFolderTitle(item.name, config?.library?.recognition?.fixedMappings)) {
+        // 目录名带年份但目录里塞了多部不同年份的影片（同系列多续作放一个文件夹）时，
+        // 「一目录一部」的假设不成立，按弱标题目录处理，交给散文件分组各认各的。
+        const spansMovies = folderSpansMultipleMovieYears(scanned.files);
+        if (!isWeakOrganizeFolderTitle(item.name, config?.library?.recognition?.fixedMappings) && !spansMovies) {
           const validation = await validateStrongFolderTitle(options.tmdb, item.name, config, options);
           if (!validation.available || validation.media) {
             assignFileVariantLabels(scanned.files, item.name, config);
@@ -27078,16 +27188,17 @@ ${end.comment}` : end.comment;
     async runGenerateSecondaryFastlink(items, seedOptions = null) {
       const settings = this.config.fastlinkTools || {};
       const checkpoint = createFastlinkScanCheckpoint(items, this.fastlinkExportOptions());
-      if (checkpoint.resumed) this.toast(`\u7EED\u63A5\u4E0A\u6B21\u626B\u63CF\uFF1A\u5DF2\u6709 ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\u7684\u8FDB\u5EA6`, "info");
+      if (checkpoint.resumed) this.toast(`续接上次扫描：已有 ${checkpoint.state.files.length} 个文件的进度`, "info");
       this.fastlink.salvage = null;
       try {
         const outcome = await this.runFastlinkTask("secondaryExport", async (signal) => {
-          this.setProgress(0, 2, checkpoint.resumed ? `\u7EED\u63A5\u626B\u63CF\uFF08\u5DF2\u626B ${checkpoint.state.files.length} \u4E2A\u6587\u4EF6\uFF09` : "\u626B\u63CF\u79D2\u4F20\u6587\u4EF6");
+          this.setProgress(0, items.length, checkpoint.resumed ? `续接扫描（已扫 ${checkpoint.state.files.length} 个文件）` : "扫描秒传文件");
           return generateSecondaryFastlink(this.api, items, {
             signal,
             ...(seedOptions || this.fastlinkSeedOptions()),
             useJson: settings.secondaryUseJson !== false,
             ...this.fastlinkExportOptions(),
+            concurrency: this.config.requests.writeConcurrency,
             checkpoint,
             onDetail: (event) => this.fastlinkDetail(event),
             onProgress: (done, total, message) => this.setProgress(done, total, message)
@@ -27097,19 +27208,19 @@ ${end.comment}` : end.comment;
           this.offerFastlinkSalvage("secondaryExport", outcome.error);
           return;
         }
-        const artifact = outcome.result;
-        this.fastlink.artifacts = [artifact];
-        this.fastlink.fileCount = artifact.fileCount;
+        const artifacts = outcome.result;
+        this.fastlink.artifacts = artifacts;
+        this.fastlink.fileCount = artifacts.reduce((sum, artifact) => sum + artifact.fileCount, 0);
         this.syncFastlinkCheckpointSummary();
-        // 生成成功即自动直投：二级短链推给客户端生成投稿草稿（与分享直投同一接口）。
+        // 生成成功即自动直投：每个顶层项目一条二级短链，逐链接推给客户端各建一条投稿草稿（与分享直投同一接口）。
         // 只推短链种子（单条记录，必不超 TG「秒传链接」复制按钮 256 字符上限），
         // 频道帖靠复制按钮取内容，不再附带秒传 JSON 文件。
-        const pushNote = await this.pushFastlinkSubmissionDraft(artifact);
-        if (this.completeFastlinkTask(outcome.task, artifact)) {
+        const pushNote = await this.pushFastlinkSubmissionDraft(artifacts);
+        if (this.completeFastlinkTask(outcome.task, artifacts)) {
           if (pushNote) this.toast(pushNote, "warning");
           return;
         }
-        this.toast(pushNote || "二级秒传链接已生成，投稿草稿已推送", pushNote ? "warning" : "success");
+        this.toast(pushNote || `已生成 ${artifacts.length} 条二级秒传链接，投稿草稿已推送`, pushNote ? "warning" : "success");
         this.syncFastlinkCheckpointSummary();
         this.render();
       } catch (error) {
@@ -27119,19 +27230,20 @@ ${end.comment}` : end.comment;
     }
     // 二级链接生成后自动直投客户端生成投稿草稿：和分享链接直投走同一接口、同一响应校验。
     // 推送失败只提示、不影响已生成的链接；返回空字符串表示推送成功。
-    async pushFastlinkSubmissionDraft(artifact) {
-      const link = String(artifact?.link || "").trim();
-      if (!link) return "";
+    // 二级链接生成后自动直投客户端生成投稿草稿：和分享链接直投走同一接口、同一响应校验。
+    // 每个顶层项目一条短链，组装成数组一次提交，客户端逐条各建一条草稿（与分享直投一致）。
+    // 推送失败只提示、不影响已生成的链接；返回空字符串表示全部推送成功。
+    async pushFastlinkSubmissionDraft(artifacts) {
+      const list = (Array.isArray(artifacts) ? artifacts : [artifacts]).filter((artifact) => String(artifact?.link || "").trim());
+      if (!list.length) return "";
       const submissionUrl = String(this.config.share?.submissionUrl || "").trim();
       if (!submissionUrl) return "还没配置投稿地址，本次只生成了链接（设置 → 分享与秒传 → 投稿地址）";
-      const name = String(artifact.item?.name || artifact.filename || "秒传分享").replace(/\.123fastlink\.(?:json|txt)$/i, "").trim() || "秒传分享";
-      try {
-        // 带上种子内容里抽出的真实文件名/总体积（前 1000 条）：
+      const skipReleaseGroup = (this.config.fastlinkTools || {}).stripReleaseGroup === true;
+      const shares = list.map((artifact) => {
+        // 草稿名取顶层项目名；带上种子内容里抽出的真实文件名/总体积（前 1000 条）：
         // 客户端识别剧集类型、画质、真实大小全靠这些，种子名里没有
+        const name = String(artifact.item?.name || artifact.filename || "秒传分享").replace(/\.123fastlink\.(?:json|txt)$/i, "").trim() || "秒传分享";
         const sourceText = buildFastlinkSubmissionContext(name, artifact?.text);
-        // 开了「导出时去除文件名发布组」时告诉客户端别再识别发布组——名字里已经没有了，
-        // 客户端按尾段乱猜反而会把画质/编码等尾缀当成发布组
-        const skipReleaseGroup = (this.config.fastlinkTools || {}).stripReleaseGroup === true;
         // 脚本全量算好的技术识别（季集范围/画质/来源/编码等），客户端逐字段优先采用；
         // 自定义映射表与整理同源。开「去除文件名发布组」时把扫描阶段留存的原始发布组一并带给
         // 客户端做发布组路由（种子名已被洗掉组名，客户端自己识别不到）
@@ -27139,9 +27251,16 @@ ${end.comment}` : end.comment;
           stripReleaseGroup: skipReleaseGroup,
           strippedReleaseGroups: artifact?.strippedReleaseGroups || ""
         });
-        const results = await this.submissionClient.submitShares(submissionUrl, [{ name, url: link, sourceText, skipReleaseGroup, meta }]);
-        const failed = results.find((item) => item.status === "failed");
-        return failed ? `投稿草稿推送失败：${failed.message || "客户端没有返回结果"}` : "";
+        return { name, url: String(artifact.link).trim(), sourceText, skipReleaseGroup, meta };
+      });
+      try {
+        const results = await this.submissionClient.submitShares(submissionUrl, shares);
+        const failed = (results || []).filter((item) => item.status === "failed");
+        if (!failed.length) return "";
+        const reason = failed[0].message || "客户端没有返回结果";
+        return failed.length >= (results || []).length
+          ? `投稿草稿推送失败：${reason}`
+          : `${failed.length}/${results.length} 条投稿草稿推送失败：${reason}`;
       } catch (error) {
         if (error?.name === "AbortError") throw error;
         return `投稿草稿推送失败：${error instanceof Error ? error.message : String(error)}`;

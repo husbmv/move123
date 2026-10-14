@@ -168,14 +168,14 @@ const paths = (json) => sorted(data(json).files.map((file) => file.path));
     }
   };
   const items = [{ id: "f1", name: "剧集", type: 1 }];
-  const artifact = await generateSecondaryFastlink(api, items, { ...ON, useJson: true, useFolderName: true, seedFolderId: "9" });
+  const [artifact] = await generateSecondaryFastlink(api, items, { ...ON, useJson: true, useFolderName: true, seedFolderId: "9" });
   assert.equal(uploaded[0].parentId, "9");
   assert.deepEqual(data(uploaded[0].content).files.map((file) => file.path).sort(), sorted(["Show.S01E01.1080p.WEB-DL.H264.mkv", "Show.S01E02.1080p.WEB-DL.H264.mkv"]), "种子内容里的文件名应去掉发布组");
   assert.equal(artifact.strippedReleaseGroups, "GROUP1/GROUP2", "去组时要在原名被洗掉前把发布组收集出来，供直投 meta 带回客户端做路由");
   assert.equal(artifact.link.split("#").at(-1), uploaded[0].fileName, "短链指向的名字必须就是实际上传的种子文件名");
-  const txtArtifact = await generateSecondaryFastlink(api, items, { ...ON, useJson: false, useFolderName: true, seedFolderId: "9" });
+  const [txtArtifact] = await generateSecondaryFastlink(api, items, { ...ON, useJson: false, useFolderName: true, seedFolderId: "9" });
   assert.ok(!/GROUP1|GROUP2/.test(txtArtifact.text), "txt 形态的种子内容同样去掉发布组");
-  const plainArtifact = await generateSecondaryFastlink(api, items, { useJson: true, useFolderName: true, seedFolderId: "9" });
+  const [plainArtifact] = await generateSecondaryFastlink(api, items, { useJson: true, useFolderName: true, seedFolderId: "9" });
   assert.ok(plainArtifact.text.includes("GROUP1"), "不勾选时种子内容保持原名");
   assert.equal(plainArtifact.strippedReleaseGroups, "", "不勾选时不收集发布组（客户端照常自己识别）");
   console.log("ok 二级链接：内容去组名，短链文件名与实际种子一致");
@@ -225,9 +225,10 @@ const paths = (json) => sorted(data(json).files.map((file) => file.path));
   assert.equal((bundle.match(/buildFastlinkJson\(filtered, options\)/g) || []).length, 2, "分享页搜索与官方搜索的生成秒传都要按设置去发布组");
   assert.ok(bundle.includes("{ ...options, stripReleaseGroup: false }"), "二级短链里的种子文件名要与实际上传的一致，不参与去组名");
   // 直投标记：勾选去发布组后推给客户端的这条要带 skipReleaseGroup，客户端不再乱认发布组
-  const pushSlice = bundle.slice(bundle.indexOf("async pushFastlinkSubmissionDraft(artifact) {"), bundle.indexOf("async restoreFastlinkFromCloudFile() {"));
+  const pushSlice = bundle.slice(bundle.indexOf("async pushFastlinkSubmissionDraft(artifacts) {"), bundle.indexOf("async restoreFastlinkFromCloudFile() {"));
   assert.ok(pushSlice.includes("const skipReleaseGroup = (this.config.fastlinkTools || {}).stripReleaseGroup === true;"), "直投要按开关决定 skipReleaseGroup");
   assert.ok(pushSlice.includes("sourceText, skipReleaseGroup, meta }"), "skipReleaseGroup 与 meta 要随种子条目一起提交");
+  assert.ok(pushSlice.includes("submitShares(submissionUrl, shares)"), "多个顶层项目要一次批量提交，客户端逐条建草稿");
   assert.ok(bundle.includes("...(item.skipReleaseGroup ? { skipReleaseGroup: true } : {})"), "submitShares 只在该条目带了标记时才提交 skipReleaseGroup 字段");
   console.log("ok 设置页勾选与控制器参数链接线在位");
 }

@@ -92,12 +92,22 @@ const { SCRIPT_CHANGELOG, scriptVersion, maybeShowUpdateNotes, changelogDialogHt
   console.log(`ok 更新说明头部版本与 @version 一致（${header[1]}）`);
 }
 
-// —— 用例 2：新版本的 notes 不能是空的（弹空窗不如不弹） ——
+// —— 用例 2：新版本的 notes 不能是空的（弹空窗不如不弹），且必须是「小白话」写法 ——
 {
   const entry = SCRIPT_CHANGELOG[0];
-  assert.ok(Array.isArray(entry.notes) && entry.notes.length >= 3, "每个版本至少写 3 条更新要点");
+  // 一个功能或优化就写一行，有几条写几条、不凑数（维护者 2026-10-14 取消「至少 3 条」）
+  assert.ok(Array.isArray(entry.notes) && entry.notes.length >= 1, "每个版本至少写 1 条更新要点，条数不设下限");
   assert.ok(entry.notes.every((note) => String(note).length > 8), "更新要点不该是占位文本");
-  console.log(`ok 本版更新说明含 ${entry.notes.length} 条要点`);
+  // 写法约定（维护者 2026-10-13 定，见 AGENTS.md 版本号规则）：一个功能或优化一行、小白话。
+  // 机检三条红线：单行、一眼看完（≤40 字）、不写实现细节（字段名/函数名/属性名/文件名/代码符号）。
+  const IMPLEMENTATION_HINTS = /[`_]|\.mjs|\.py|\.json|schemaVersion|fixedMappings|c123|data-|\(\)|\bvar\b|\bfunction\b|\btrue\b|\bfalse\b/;
+  for (const note of entry.notes) {
+    const text = String(note);
+    assert.ok(!text.includes("\n"), `更新要点要一行写完: ${text}`);
+    assert.ok(text.length <= 40, `更新要点要一眼看完（≤40 字，当前 ${text.length} 字）: ${text}`);
+    assert.ok(!IMPLEMENTATION_HINTS.test(text), `更新要点不该出现实现细节（字段名/文件名/代码符号）: ${text}`);
+  }
+  console.log(`ok 本版更新说明含 ${entry.notes.length} 条要点（单行 · ≤40 字 · 无实现细节）`);
 }
 
 // —— 用例 3：存储门控（新版本弹一次；已读不再弹；没有记录的版本静默记已读） ——

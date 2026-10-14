@@ -95,4 +95,30 @@ assert.ok(ids(fresh).has("source-it"), "新装默认表含 iT 来源");
 assert.ok(DEFAULT_FIXED_MAPPINGS.some((item) => item?.id === "video-avs2"), "DEFAULT_FIXED_MAPPINGS 应含 AVS2");
 console.log("ok 新装默认表自带 AVS 编码与常用来源");
 
+// 6. SDR 一律不标注：fixedMappings 是首装快照，1.4.7 及更早种下的 dynamic-sdr 条目不会
+// 因为默认表删了条目就自己消失（「SDR 还是能识别到」的根因）。归一化这道闸必须把存量
+// 快照里的 SDR 条目与 SDR 别名都剥掉，且不碰「VIVID SDR → EDR」这类高规格别名。
+const sdrName = "Movie.2024.1080p.WEB-DL.HEVC.AAC.SDR";
+const legacySdr = normalizeConfig({
+  schemaVersion: 16,
+  library: { recognition: { fixedMappings: [
+    { id: "dynamic-hdr10", field: "dynamicRange", aliases: ["HDR10", "HDR 10"], output: "HDR10" },
+    { id: "dynamic-sdr", field: "dynamicRange", aliases: ["SDR"], output: "SDR" },
+    // 别名里混着 SDR 的老条目：剥别名、留条目，否则纯 SDR 文件会被误判成 HDR
+    { id: "custom-range", field: "dynamicRange", aliases: ["HDR", "sdr"], output: "HDR" },
+    { id: "quality-edr", field: "highQuality", aliases: ["EDR", "VIVID SDR"], output: "EDR" }
+  ] } }
+});
+const sdrOutputs = legacySdr.library.recognition.fixedMappings.filter((item) => item?.field === "dynamicRange").map((item) => item?.output);
+assert.deepEqual([...sdrOutputs], ["HDR10", "HDR"], "存量快照里的 SDR 条目应被剥掉，其余动态范围条目原样保留");
+assert.deepEqual([...(legacySdr.library.recognition.fixedMappings.find((item) => item?.id === "custom-range")?.aliases || [])], ["HDR"], "动态范围条目里的 SDR 别名应被剥掉");
+const sdrFields = inferTechnicalFields(sdrName, legacySdr.library.recognition.fixedMappings);
+assert.equal(sdrFields.dynamicRange, "", `SDR 不该成为动态范围: ${sdrFields.dynamicRange}`);
+assert.equal(sdrFields.effect, "", `SDR 不该进 effect: ${sdrFields.effect}`);
+const hdrFields = inferTechnicalFields("Movie.2024.1080p.WEB-DL.HDR10.HEVC.AAC", legacySdr.library.recognition.fixedMappings);
+assert.equal(hdrFields.dynamicRange, "HDR10", "剥 SDR 别名后真档位照常识别");
+const edrFields = inferTechnicalFields("Movie.2024.1080p.WEB-DL.VIVID.SDR.HEVC.AAC", legacySdr.library.recognition.fixedMappings);
+assert.equal(edrFields.highQuality, "EDR", "「VIVID SDR」是高规格/EDR 的别名，不能被 SDR 闸误伤");
+console.log("ok 存量快照里的 SDR 条目/别名被剥掉，真档位与 EDR 别名不受影响");
+
 console.log("fixed-mappings-seed.test.mjs 全部通过");

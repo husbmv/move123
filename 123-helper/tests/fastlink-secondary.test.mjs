@@ -162,7 +162,9 @@ test("生成二级链接：种子上传内容为一级 JSON，链接为单文件
     filesById: {}
   };
   const api = createMockApi(state);
-  const artifact = await generateSecondaryFastlink(api, [{ id: "10", name: "剧集", type: 1 }], { currentDir: "0", seedFolderId: "", useJson: true });
+  const artifacts = await generateSecondaryFastlink(api, [{ id: "10", name: "剧集", type: 1 }], { currentDir: "0", seedFolderId: "", useJson: true });
+  assert.equal(artifacts.length, 1);
+  const artifact = artifacts[0];
   assert.equal(state.uploads.length, 1);
   const seed = state.uploads[0];
   assert.equal(seed.name, "剧集.123fastlink.json");
@@ -177,6 +179,66 @@ test("生成二级链接：种子上传内容为一级 JSON，链接为单文件
   assert.ok(seed.content.includes(hexToBase62(episodeEtag)), "一级 JSON 应包含原文件 etag（Base62 形式）");
   const oneLevel = parseFastlink(artifact.text);
   assert.equal(oneLevel.files[0].fileName, "第01集.mp4");
+});
+
+test("生成二级链接：多个顶层项目分别生成各自的种子与短链，互不混入", async () => {
+  const aEtag = md5("A01内容");
+  const bEtag = md5("B01内容");
+  const state = {
+    uploadSeq: 0,
+    uploads: [],
+    tree: {
+      0: [{ id: "10", name: "剧A", type: 1 }, { id: "20", name: "剧B", type: 1 }],
+      10: [{ id: "11", name: "A01.mp4", type: 0, size: 5, etag: aEtag }],
+      20: [{ id: "21", name: "B01.mp4", type: 0, size: 7, etag: bEtag }]
+    },
+    info: {},
+    cloud: {},
+    filesById: {}
+  };
+  const api = createMockApi(state);
+  // 给上传加真实延迟，观测并发峰值（与分享链接 createShares 同为 mapLimit 并发）
+  let inflight = 0;
+  let maxInflight = 0;
+  const baseUpload = api.uploadTextFile.bind(api);
+  api.uploadTextFile = async (...args) => {
+    inflight += 1;
+    maxInflight = Math.max(maxInflight, inflight);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    inflight -= 1;
+    return baseUpload(...args);
+  };
+  const delivered = [];
+  const artifacts = await generateSecondaryFastlink(
+    api,
+    [{ id: "10", name: "剧A", type: 1 }, { id: "20", name: "剧B", type: 1 }],
+    {
+      currentDir: "0",
+      seedFolderId: "",
+      useJson: true,
+      concurrency: 3,
+      onArtifact: (artifact, done, total) => delivered.push({ name: artifact.item?.name, done, total })
+    }
+  );
+  assert.equal(maxInflight, 2, "两个种子应并发上传（与分享链接同构），而不是串行");
+  assert.equal(artifacts.length, 2, "两个顶层项目应产出两个 artifact");
+  assert.equal(state.uploads.length, 2, "应上传两个种子文件，而不是合并成一个");
+  assert.equal(state.uploads[0].name, "剧A.123fastlink.json");
+  assert.equal(state.uploads[1].name, "剧B.123fastlink.json");
+  // 每个种子的一级 JSON 只包含自己项目的文件，不混入另一个项目
+  const payloadA = JSON.parse(state.uploads[0].content);
+  const payloadB = JSON.parse(state.uploads[1].content);
+  assert.deepEqual(payloadA.files.map((file) => file.fileName), ["A01.mp4"]);
+  assert.deepEqual(payloadB.files.map((file) => file.fileName), ["B01.mp4"]);
+  // 每条短链只含 1 个种子记录且指向各自的种子
+  for (const [index, artifact] of artifacts.entries()) {
+    const parsed = parseFastlink(artifact.link);
+    assert.equal(parsed.files.length, 1, "二级链接应只包含 1 个种子文件");
+    assert.equal(parsed.files[0].etag, state.uploads[index].etag);
+    assert.equal(artifact.item?.name, ["剧A", "剧B"][index], "artifact.item 保留源项目，供直投草稿命名");
+    assert.equal(artifact.filename, state.uploads[index].name);
+  }
+  assert.deepEqual(delivered, [{ name: "剧A", done: 1, total: 2 }, { name: "剧B", done: 2, total: 2 }], "逐顶层项交付回调");
 });
 
 test("保存二级链接：先秒传种子，再按种子内容完整转存", async () => {
