@@ -20,12 +20,12 @@ const code = [
   slice("// src/core/category-yaml.js", "// src/core/empty-folders.js")
 ].join("\n");
 const driver = `;
-globalThis.__recognition = { parseEpisodeHint, specialContext, matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, reconcileCalibrationSeason, previewEpisodeCalibration, isVideoFile, extractKeywordKinds, applySpecialKeywordMappings, defaultSpecialKeywordPatterns, normalizeConfig, getSpecialKindTokens: () => SPECIAL_KIND_TOKENS };
+globalThis.__recognition = { parseEpisodeHint, specialContext, matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, reconcileCalibrationSeason, previewEpisodeCalibration, isVideoFile, extractKeywordKinds, applySpecialKeywordMappings, defaultSpecialKeywordPatterns, normalizeConfig, assignFileVariantLabels, getSpecialKindTokens: () => SPECIAL_KIND_TOKENS };
 `;
 const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException, setTimeout, clearTimeout };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { parseEpisodeHint, matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, reconcileCalibrationSeason, previewEpisodeCalibration, extractKeywordKinds, applySpecialKeywordMappings, defaultSpecialKeywordPatterns, specialContext, normalizeConfig, getSpecialKindTokens } = sandbox.__recognition;
+const { parseEpisodeHint, matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, reconcileCalibrationSeason, previewEpisodeCalibration, extractKeywordKinds, applySpecialKeywordMappings, defaultSpecialKeywordPatterns, specialContext, normalizeConfig, assignFileVariantLabels, getSpecialKindTokens } = sandbox.__recognition;
 
 // —— TMDB《嗨放派》(id 131777) 真实季集数据（2026-08 从 themoviedb.org 核对）——
 const ep = (season, episode, name, airDate) => ({ id: `s${season}e${episode}`, seasonNumber: season, episodeNumber: episode, name, airDate });
@@ -68,7 +68,10 @@ const stubTmdb = {
   async details() { return TMDB_MEDIA; },
   async season(_id, season) { return EPISODE_POOL[season] || []; }
 };
-const group = (files, extraFields = {}) => ({ fields: { mediaType: "tv", season: "1", ...extraFields }, media: TMDB_MEDIA, files: files.map((name, index) => ({ id: String(index + 1), name })) });
+const group = (files, extraFields = {}) => {
+  const { media: mediaOverride, ...fieldOverrides } = extraFields;
+  return { fields: { mediaType: "tv", season: "1", ...fieldOverrides }, media: mediaOverride || TMDB_MEDIA, files: files.map((name, index) => ({ id: String(index + 1), name })) };
+};
 const memberFile = "[20221107][嗨放派 第二季 会员版 第09期].Have.Fun.VIP.Version.2022.S01E09.2160p.WEB-DL.H265.AAC-UBWEB.mp4";
 const extraFile = "[20221114][嗨放派 第二季 加更版 第10期].Have.Fun.Extra.2022.S01E10.2160p.WEB-DL.H265.AAC-UBWEB.mp4";
 const regularFile = "[20220827][嗨放派 第二季 第04期].Have.Fun.2022.S01E04.2160p.WEB-DL.HQ.H265.10bit.AAC-UBWEB.mp4";
@@ -478,6 +481,129 @@ test("showAllSpecials 配置：默认关、只认严格 true", () => {
   assert.equal(base.tmdb.showAllSpecials, false, "首装默认关闭");
   assert.equal(normalizeConfig({ tmdb: { credential: "", language: "zh-CN", region: "CN", apiBase: "", showAllSpecials: true } }).tmdb.showAllSpecials, true);
   assert.equal(normalizeConfig({ tmdb: { showAllSpecials: "1" } }).tmdb.showAllSpecials, false, "字符串 1 不算开启");
+});
+
+// —— 《密室大逃脱》(TMDB 89861) 真实数据形态：第8季25集正片，每期上下拆成连续两集 ——
+// S00 只有花絮：超前聚会/超前/超前彩蛋/Plus 版，没有正片条目。
+const partName = (date, issue, part) => `[${date}][密室大逃脱 第八季 第0${issue}期 ${part === 1 ? "上" : "下"}].Great.Escape.2026.S08E0${issue}.Part0${part}.2160p.WEB-DL.H265.AAC-UBWEB.mp4`;
+const plusName = "[20260724][密室大逃脱 第八季 Plus版 第01期].Great.Escape.Plus.Version.2026.S08E01.2160p.WEB-DL.H265.AAC-UBWEB.mp4";
+const REAL_S8_TITLES = ["绝叫山庄Ⅰ（上）", "绝叫山庄Ⅰ（下）", "绝叫山庄Ⅱ（上）", "绝叫山庄Ⅱ（下）", "公馆离情Ⅰ（上）", "公馆离情Ⅰ（下）", "公馆离魂Ⅱ（上）", "公馆离魂Ⅱ（下）", "禁忌学园Ⅰ（上）", "禁忌学园Ⅰ（下）", "禁忌学园Ⅱ（上）", "禁忌学园Ⅱ（下）", "云绮织梦Ⅰ（上）", "云绮织梦Ⅰ（下）", "云绮织梦Ⅱ（上）", "云绮织梦Ⅱ（下）", "狼来了Ⅰ（上）", "狼来了Ⅰ（下）", "狼来了Ⅱ（上）", "狼来了Ⅱ（下）", "友爱之家Ⅰ（上）", "友爱之家Ⅰ（下）", "友爱之家Ⅱ（上）", "友爱之家Ⅱ（下）", "收官宴"];
+const REAL_S8 = REAL_S8_TITLES.map((name, index) => ep(8, index + 1, name, index === 16 || index === 17 ? "2026-09-16" : index === 18 ? "2026-09-23" : index === 24 ? "2026-10-14" : ""));
+const REAL_SPECIALS = [
+  ep(0, 180, "第八季 超前聚会（上）", "2026-07-15"),
+  ep(0, 181, "第八季 超前聚会（下）", "2026-07-15"),
+  ep(0, 182, "第八季 超前", "2026-07-21"),
+  ep(0, 183, "第八季 Plus版第1期", "2026-07-24"),
+  ep(0, 184, "第八季 超前彩蛋第2期", "2026-07-29"),
+  ep(0, 185, "第八季 Plus版第2期", "2026-07-31")
+];
+const REAL_MEDIA_SEASONS = [0, 1, 2, 3, 4, 5, 6, 7, 8].map((season) => ({ season_number: season, air_date: season === 8 ? "2026-07-22" : undefined }));
+const REAL_MEDIA = { id: 89861, mediaType: "tv", name: "密室大逃脱", year: "2019", seasons: REAL_MEDIA_SEASONS };
+const realStub = {
+  async details() { return REAL_MEDIA; },
+  async season(_id, season) { return season === 0 ? REAL_SPECIALS : season === 8 ? REAL_S8 : []; }
+};
+
+test("板块词提取：季标记「第八季」与分段字「上/下」不再被当成板块名", () => {
+  const files = [{ id: "1", name: partName("20260722", 1, 1) }];
+  assignFileVariantLabels(files, "密室大逃脱", {});
+  assert.equal(files[0].sectorWord, "", "第八季是季归属、上是分段，都不该写成板块词");
+  const named = [{ id: "1", name: "[初入职场·中医季 药食同源 第01期].Workplace.S05E01.2160p.WEB-DL.mp4" }];
+  assignFileVariantLabels(named, "初入职场·中医季", {});
+  assert.equal(named[0].sectorWord, "药食同源", "真正的板块名仍要识别（回归保护）");
+});
+
+test("真实数据：第8季存在时，Part01/02 上下校准到正季连续集，不再写成空集号 S00", async () => {
+  const g = group([
+    partName("20260722", 1, 1), partName("20260722", 1, 2), plusName,
+    partName("20260729", 2, 1), partName("20260729", 2, 2)
+  ], { season: "8", seasonEpisode: "S08E01", media: REAL_MEDIA });
+  assignFileVariantLabels(g.files, "密室大逃脱", {});
+  const result = await previewEpisodeCalibration(realStub, g);
+  const of = (index) => result.matches[String(index + 1)];
+  assert.deepEqual([[of(0).seasonNumber, of(0).episodeNumber], [of(1).seasonNumber, of(1).episodeNumber]], [[8, 1], [8, 2]], "第01期 上/下 → S08E01 绝叫山庄Ⅰ（上）/ S08E02（下）");
+  assert.deepEqual([[of(3).seasonNumber, of(3).episodeNumber], [of(4).seasonNumber, of(4).episodeNumber]], [[8, 3], [8, 4]], "第02期 上/下 → S08E03/E04，累计偏移");
+  assert.equal(of(2).seasonNumber, 0);
+  assert.equal(of(2).episodeNumber, 183, "Plus 版第01期仍走标题标签匹配 → S00E183");
+  assert.match(of(2).reason, /标题标签匹配/);
+});
+
+test("守卫：第8季在 TMDB 存在但本次拉取失败时，正片上下宁可留未校准，也不错挂到 S00 花絮", async () => {
+  const failingStub = {
+    async details() { return REAL_MEDIA; },
+    async season(_id, season) { return season === 0 ? REAL_SPECIALS : []; }
+  };
+  const g = group([partName("20260722", 1, 1), partName("20260722", 1, 2)], { season: "8", seasonEpisode: "S08E01", media: REAL_MEDIA });
+  assignFileVariantLabels(g.files, "密室大逃脱", {});
+  const result = await previewEpisodeCalibration(failingStub, g);
+  assert.equal(result.matches["1"], undefined, "S00 里的超前聚会/超前/Plus 不是正片，不能占这个位");
+  assert.equal(result.matches["2"], undefined);
+});
+
+// —— 兜底场景：TMDB 资料里压根没有该正季（某些综艺只有 S00），Part 上下才在本季 S00 条目上展开 ——
+const VAR_SPECIALS = [
+  ep(0, 181, "第七季 收官晚宴", "2025-09-12"),
+  ep(0, 182, "第八季 超前", "2026-07-21"),
+  ep(0, 183, "第八季 Plus版第1期", "2026-07-24"),
+  ep(0, 184, "第八季 第2期", "2026-07-31"),
+  ep(0, 185, "第八季 第3期", "2026-08-07")
+];
+const VAR_MEDIA = {
+  id: 89861, mediaType: "tv", name: "密室大逃脱", year: "2019",
+  seasons: [{ season_number: 0, air_date: "2019-03-01" }, { season_number: 7, air_date: "2025-07-08" }]
+};
+const varStub = {
+  async details() { return VAR_MEDIA; },
+  async season(_id, season) { return season === 0 ? VAR_SPECIALS : []; }
+};
+
+test("端到端：正片编在 S00 的综艺，上下集按 Part 顺序展开到连续的特典季条目", async () => {
+  const g = group([
+    partName("20260722", 1, 1), partName("20260722", 1, 2),
+    partName("20260729", 2, 1), partName("20260729", 2, 2)
+  ], { season: "8", seasonEpisode: "S08E01", media: VAR_MEDIA });
+  assignFileVariantLabels(g.files, "密室大逃脱", {});
+  const result = await previewEpisodeCalibration(varStub, g);
+  const of = (index) => result.matches[String(index + 1)];
+  assert.deepEqual([1, 2, 3, 4].map((index) => [of(index - 1).seasonNumber, of(index - 1).episodeNumber]), [[0, 182], [0, 183], [0, 184], [0, 185]], "E01 上下→182/183，E02 上下→184/185");
+  for (let i = 0; i < 4; i += 1) assert.match(of(i).reason, /特典季 Part 分段上下顺序匹配/);
+});
+
+test("S00 顺序网格不抢强关键词变体：Plus版文件保留标题匹配，下集仍按顺序占同一条目", async () => {
+  const g = group([
+    partName("20260722", 1, 1), partName("20260722", 1, 2), plusName,
+    partName("20260729", 2, 1), partName("20260729", 2, 2)
+  ], { season: "8", seasonEpisode: "S08E01", media: VAR_MEDIA });
+  assignFileVariantLabels(g.files, "密室大逃脱", {});
+  const result = await previewEpisodeCalibration(varStub, g);
+  const of = (index) => result.matches[String(index + 1)];
+  assert.deepEqual([of(0).episodeNumber, of(1).episodeNumber], [182, 183]);
+  assert.equal(of(2).seasonNumber, 0);
+  assert.equal(of(2).episodeNumber, 183, "Plus 版第01期=同集加长版，保留自己的标题匹配");
+  assert.match(of(2).reason, /标题标签匹配/);
+  assert.deepEqual([of(3).episodeNumber, of(4).episodeNumber], [184, 185], "后续期数继续累计，不被 Plus 文件挤位");
+});
+
+test("守卫：总开关关闭（正季存在）时即使无候选也不进 S00 网格", () => {
+  const groupFiles = files([partName("20260722", 1, 1), partName("20260722", 1, 2)]);
+  const matches = matchEpisodeCandidates(groupFiles, REAL_SPECIALS, 8, 8, null, { targetSeasonMissing: false });
+  assert.equal(matches.get("1"), undefined);
+  assert.equal(matches.get("2"), undefined);
+});
+
+test("守卫：没有 Part/上下分段证据时，缺季的普通单集不整批挪进 S00", () => {
+  const groupFiles = files(["Great.Escape.2026.S08E01.2160p.WEB-DL.H265.AAC.mp4", "Great.Escape.2026.S08E02.2160p.WEB-DL.H265.AAC.mp4"]);
+  const matches = matchEpisodeCandidates(groupFiles, VAR_SPECIALS, 8, 8, null, { targetSeasonMissing: true });
+  assert.equal(matches.get("1"), undefined);
+  assert.equal(matches.get("2"), undefined);
+});
+
+test("守卫：S00 条目只带别的季标记（第七季）时不上 S00 顺序网格", () => {
+  const pool = [ep(0, 1, "第七季 第1期", "2026-07-08"), ep(0, 2, "第七季 第2期", "2026-07-15")];
+  const groupFiles = files([partName("20260722", 1, 1), partName("20260722", 1, 2)].map((name) => name.replace(/密室大逃脱 第八季/, "别的节目 第八季")));
+  const matches = matchEpisodeCandidates(groupFiles, pool, 8, 8, null, { targetSeasonMissing: true });
+  assert.equal(matches.get("1"), undefined);
+  assert.equal(matches.get("2"), undefined);
 });
 
 await chain;

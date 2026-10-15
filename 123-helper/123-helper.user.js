@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.4.10
+// @version      1.4.11
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -6950,6 +6950,13 @@
   // 历史版本条目不用回改（弹窗只按当前版本号取对应那一版）。机检在 changelog-notice.test.mjs。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.4.11",
+      notes: [
+        "综艺一期分成上下两个文件时，校准后按集数递增排好，不再都变成空集号撞名",
+        "正片和花絮（如 Plus 版、超前彩蛋）各认各的条目，不再张冠李戴"
+      ]
+    },
     {
       version: "1.4.10",
       notes: [
@@ -19957,21 +19964,22 @@ ${end.comment}` : end.comment;
     }
     return { splitGroups, mergeGroups };
   }
-  function applySequentialEpisodeMatches(entries, episodes, output) {
-    const seasons = new Set(entries.map((entry2) => entry2.hint.season).filter((value) => value > 0));
-    for (const targetSeason of seasons) {
-      const candidates = episodes.filter((episode) => episode.seasonNumber === targetSeason).sort((left, right) => left.episodeNumber - right.episodeNumber || left.airDate.localeCompare(right.airDate));
-      const seasonEntries = entries.filter((entry2) => entry2.video && entry2.hint.season === targetSeason && entry2.sourceEpisode > 0 && !entry2.context.strong && !entry2.context.contextual).sort((left, right) => left.sourceEpisode - right.sourceEpisode || (left.part || 1) - (right.part || 1) || naturalCompare(left.file.name, right.file.name));
-      if (!candidates.length || !seasonEntries.length) continue;
-      const { splitGroups, mergeGroups } = sequentialEpisodeGroups(seasonEntries, candidates);
-      const absoluteSequence = seasonEntries.filter((entry2) => entry2.hint.absolute > 0).length >= 2;
-      if (!splitGroups.size && !mergeGroups.length && !absoluteSequence) continue;
-      const firstSource = Math.min(...seasonEntries.map((entry2) => entry2.sourceEpisode));
+  function applySequentialEpisodeMatches(entries, episodes, output, options = {}) {
+    const orderEpisodes = (list) => [...list].sort((left, right) => left.episodeNumber - right.episodeNumber || left.airDate.localeCompare(right.airDate));
+    const assignGrid = (gridSeason, candidates, gridEntries, gridOptions = {}) => {
+      if (!candidates.length || !gridEntries.length) return;
+      const { splitGroups, mergeGroups } = sequentialEpisodeGroups(gridEntries, candidates);
+      const absoluteSequence = gridEntries.filter((entry2) => entry2.hint.absolute > 0).length >= 2;
+      if (!splitGroups.size && !mergeGroups.length && !absoluteSequence) return;
+      // 综艺把正片编在 S00（条目名带「第八季」归属）：只有拿到 Part/上下分段证据才上
+      // S00 网格，绝不因为目标正季缺条目就把普通单集整批挪进特典季。
+      if (gridOptions.specialsGrid && !splitGroups.size) return;
+      const firstSource = Math.min(...gridEntries.map((entry2) => entry2.sourceEpisode));
       const exactStart = candidates.findIndex((episode) => episode.episodeNumber === firstSource);
       let start = exactStart >= 0 ? exactStart : 0;
       const firstMerge = mergeGroups.find((group) => group.first === firstSource);
       if (firstMerge) start = candidates.indexOf(firstMerge.episode);
-      for (const entry2 of seasonEntries) {
+      for (const entry2 of gridEntries) {
         if (entry2.hint.endEpisode > entry2.hint.episode) continue;
         const source = entry2.sourceEpisode;
         const merged = mergeGroups.find((group) => group.first <= source && source <= group.last);
@@ -19991,13 +19999,40 @@ ${end.comment}` : end.comment;
         const episode = candidates[position];
         if (!episode) continue;
         const existing = output.get(String(entry2.file.id));
-        if (existing && Number(existing.seasonNumber) !== targetSeason) continue;
+        // S00 兜底网格：标题/板块名/关键词/日期等通道已给出的显式匹配一律不覆盖。
+        if (gridOptions.specialsGrid) {
+          if (existing) continue;
+        } else if (existing && Number(existing.seasonNumber) !== gridSeason) continue;
         output.set(String(entry2.file.id), {
           ...episode,
-          reason: splitGroups.size ? "TMDB Part \u5206\u6BB5\u4E0A\u4E0B\u987A\u5E8F/\u7D2F\u8BA1\u504F\u79FB\u5339\u914D" : "TMDB \u5408\u96C6/\u7EDD\u5BF9\u96C6\u6570\u987A\u5E8F\u5339\u914D",
+          reason: gridOptions.specialsGrid ? "TMDB 特典季 Part 分段上下顺序匹配" : splitGroups.size ? "TMDB Part 分段上下顺序/累计偏移匹配" : "TMDB 合集/绝对集数顺序匹配",
           confidence: "high"
         });
       }
+    };
+    const seasons = new Set(entries.map((entry2) => entry2.hint.season).filter((value) => value > 0));
+    for (const targetSeason of seasons) {
+      const seasonEntries = entries.filter((entry2) => entry2.video && entry2.hint.season === targetSeason && entry2.sourceEpisode > 0 && !entry2.context.strong && !entry2.context.contextual).sort((left, right) => left.sourceEpisode - right.sourceEpisode || (left.part || 1) - (right.part || 1) || naturalCompare(left.file.name, right.file.name));
+      if (!seasonEntries.length) continue;
+      const candidates = orderEpisodes(episodes.filter((episode) => episode.seasonNumber === targetSeason));
+      if (candidates.length) {
+        assignGrid(targetSeason, candidates, seasonEntries);
+        continue;
+      }
+      // 兜底：只有 TMDB 剧集资料里压根没有这个正季（previewEpisodeCalibration 依据
+      // media.seasons 显式告知 targetSeasonMissing）时，才认为该综艺把正片编进了 S00。
+      // 正季只是本次拉取失败（会有警告）时绝不走这里，避免把正片上下错挂到超前/Plus 等
+      // 花絮条目上。同一源集号的 Part01/Part02（上/下）在本季所属 S00 条目上连续展开，
+      // 没有「第X季」归属标记的无关特典不入池。
+      if (options.specialsFallback !== true) continue;
+      const specials = episodes.filter((episode) => episode.seasonNumber === 0);
+      if (!specials.length) continue;
+      const belongsToSeason = (episode) => namedSeasonMarkers(episode.name).includes(targetSeason);
+      if (!specials.some(belongsToSeason)) continue;
+      const fileDates = new Set(seasonEntries.map((entry2) => entry2.hint.date).filter(Boolean));
+      const affiliated = specials.filter((episode) => belongsToSeason(episode) || fileDates.has(episode.airDate));
+      const virtualEntries = seasonEntries.map((entry2) => ({ ...entry2, hint: { ...entry2.hint, season: 0 } }));
+      assignGrid(0, orderEpisodes(affiliated), virtualEntries, { specialsGrid: true });
     }
   }
   function isPilotEpisodeTitle(value) {
@@ -20080,10 +20115,17 @@ ${end.comment}` : end.comment;
   function rawSectorWord(name, baseName) {
     const split = (value) => String(value || "").replace(/\.[^.]+$/, "").split(/[._\s·-]+/).filter(Boolean);
     const base = new Set(split(baseName).map((token) => token.toLocaleLowerCase()));
-    for (const token of split(name)) {
+    for (const rawToken of split(name)) {
+      const token = rawToken.replace(/[[\]【】()（）]/g, "");
       if (base.has(token.toLocaleLowerCase())) continue;
       if (!/[\u3400-\u9fff]/.test(token)) continue;
       if (/\d/.test(token) || token.length > 12) continue;
+      // 「第八季/第2季」是季归属标记，整季每个文件都带着，绝不是板块名；
+      // 否则会拿它去 S00 匹配出一堆「第八季 …」同名条目，正片反被写成空集号 S00。
+      // 注意命名季（中医季）不含数字，seasonNumberFromText 认不出来，不受影响。
+      if (seasonNumberFromText(token) !== null) continue;
+      // 「上/中/下」是同一期的分段标记，交给 Part 分段顺序逻辑，不当板块名。
+      if (/^[\u4E0A\u4E2D\u4E0B](?:[\u96C6\u671F\u7BC7\u534A\u90E8])?$/.test(token)) continue;
       if (SECTOR_WORD_EXCLUSIONS.has(token.toLocaleLowerCase())) continue;
       return token;
     }
@@ -20289,7 +20331,7 @@ ${end.comment}` : end.comment;
       const shiftedEndEpisode = Number(entry2.effectiveEndEpisode || 0);
       return { ...entry2, sourceEpisode: shiftedEpisode, hint: { ...entry2.hint, episode: shiftedEpisode, endEpisode: shiftedEndEpisode } };
     }) : entries;
-    applySequentialEpisodeMatches(sequenceEntries, sortedEpisodes, output);
+    applySequentialEpisodeMatches(sequenceEntries, sortedEpisodes, output, { specialsFallback: options.targetSeasonMissing === true });
     for (const [index, entry2] of entries.entries()) {
       const { file, hint, context } = entry2;
       if (!entry2.video) continue;
@@ -22068,7 +22110,10 @@ ${end.comment}` : end.comment;
     } else {
       episodes = filterEpisodeCandidatesForTargetSeason(rawEpisodes, effectiveTargetSeason, fileNames, aliasesFor(effectiveTargetSeason), includeAllSpecials);
     }
-    const matches = matchEpisodeCandidates(group.files.filter((file) => isVideoFile(file.name)), episodes, Number(group.fields?.season || 1), effectiveTargetSeason, seasonRemap, { forceTargetSeason: hasManualSeason });
+    // 正季在 TMDB 资料里根本不存在（如某些综艺只有 S00）时才允许顺序匹配兜底进 S00；
+    // 季存在但本次拉取失败不算，宁可留未校准也不能把正片错挂到花絮条目。
+    const targetSeasonMissing = effectiveTargetSeason > 0 && !mediaSeasons.includes(effectiveTargetSeason);
+    const matches = matchEpisodeCandidates(group.files.filter((file) => isVideoFile(file.name)), episodes, Number(group.fields?.season || 1), effectiveTargetSeason, seasonRemap, { forceTargetSeason: hasManualSeason, targetSeasonMissing });
     return { episodes, matches: Object.fromEntries(matches), warnings };
   }
   function inferCalibrationTargetSeason(group) {
