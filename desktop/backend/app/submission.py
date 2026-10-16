@@ -336,6 +336,7 @@ async def submit_submission_links(
         raise ValueError("请先在投稿机器人配置里填写允许使用的 Telegram User ID")
     drafts: List[Dict[str, Any]] = []
     sent_count = 0
+    published_count = 0
     first_error = ""
     owner_chat = int(owner_chat_id or target)
     owner_user = int(owner_user_id or target)
@@ -343,7 +344,7 @@ async def submit_submission_links(
 
     async def _process_link(link: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """单条链接全管线：解析 → 目录扫描 → TMDB → 草稿 → 推 Bot。返回 saved 草稿或 None。"""
-        nonlocal sent_count, first_error
+        nonlocal sent_count, published_count, first_error
         try:
             normalized = normalize_submission_link(link, source_text)
             if str(normalized.get("provider") or "") != "123fastlink":
@@ -373,6 +374,18 @@ async def submit_submission_links(
             save_share_media_cache(store, str(draft.get("share", {}).get("cleanUrl") or ""), draft.get("media") if isinstance(draft.get("media"), dict) else {}, str(cached.get("source") or "auto"))
             saved = append_submission_draft(store, draft)
             if bot_token:
+                # 路由命中的频道开了「直接推送」时跳过草稿预览，直接按路由发布；
+                # 发布失败退回预览，保证内容不丢，仍可手动推送。
+                auto_push_channel = select_submission_channel(store, owner_user, saved)
+                if channel_auto_push_enabled(auto_push_channel):
+                    try:
+                        published = await publish_submission_draft(store, bot_token, config, saved, acting_user_id=owner_user)
+                        if published.get("ok"):
+                            published_count += 1
+                            return {**saved, "status": "published", "channelId": str(auto_push_channel.get("id") or "")}
+                        first_error = first_error or f"直接推送失败：{published.get('reason') or '未知原因'}"
+                    except Exception as error:
+                        first_error = first_error or f"直接推送失败：{error}"
                 try:
                     preview = await send_submission_preview_result(bot_token, target, saved, config, store=store)
                     sent_chunks = int(preview.get("sentCount") or 0)
@@ -407,6 +420,7 @@ async def submit_submission_links(
 
     return {
         "sentCount": sent_count,
+        "publishedCount": published_count,
         "draftCount": len(drafts),
         "drafts": drafts,
         **({"error": first_error} if first_error else {}),
@@ -3262,6 +3276,11 @@ def enabled_submission_channels(channels: List[Dict[str, Any]]) -> List[Dict[str
 def channel_old_post_cleanup_enabled(channel: Optional[Dict[str, Any]]) -> bool:
     """频道级「发布后清理旧帖」开关。存量配置没有 cleanupOldPosts 键按开处理，只有显式 false 才跳过清理。"""
     return bool(channel) and channel.get("cleanupOldPosts") is not False
+
+
+def channel_auto_push_enabled(channel: Optional[Dict[str, Any]]) -> bool:
+    """频道级「直接推送」开关。开启后，路由投递到该频道的投稿跳过草稿预览直接发布；缺省按关处理。"""
+    return bool(channel) and channel.get("autoPush") is True
 
 
 def build_publish_markup(draft: Dict[str, Any], config: Dict[str, Any]) -> Optional[Dict[str, Any]]:

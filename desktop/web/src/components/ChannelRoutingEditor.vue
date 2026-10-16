@@ -199,6 +199,7 @@ onMounted(async () => {
             <div class="channel-switches">
               <v-switch v-model="channel.enabled" label="启用这个频道" color="primary" density="compact" hide-details />
               <v-switch v-model="channel.cleanupOldPosts" label="发布后清理旧帖" color="primary" density="compact" hide-details />
+              <v-switch v-model="channel.autoPush" label="直接推送" color="primary" density="compact" hide-details />
             </div>
           </div>
           <v-textarea
@@ -561,7 +562,8 @@ onMounted(async () => {
 .channel-switches {
   display: flex;
   align-items: center;
-  gap: 18px;
+  flex-wrap: wrap;
+  gap: 4px 18px;
   padding-left: 2px;
 }
 

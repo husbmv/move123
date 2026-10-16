@@ -48,6 +48,8 @@ export interface Channel {
   isDefault?: boolean;
   allowedUserIds?: number[];
   cleanupOldPosts?: boolean;
+  /** 直接推送：路由命中此频道时跳过草稿预览直接发布 */
+  autoPush?: boolean;
   [key: string]: unknown;
 }
 

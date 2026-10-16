@@ -239,6 +239,69 @@ class SubmissionDraftTests(unittest.TestCase):
             self.assertEqual(send_mock.await_args.kwargs.get("parse_mode"), "HTML")
             self.assertIn("reply_markup", send_mock.await_args.kwargs)
 
+    def test_channel_auto_push_publishes_directly_without_preview(self):
+        """频道开启 autoPush 时，路由命中的投稿跳过草稿预览直接发布；关闭时维持草稿预览。"""
+        for auto_push, expect_published in ((True, True), (False, False)):
+            with self.subTest(auto_push=auto_push), tempfile.TemporaryDirectory() as directory:
+                store = SessionStore(Path(directory))
+                store.write_submission_config(
+                    {
+                        "botToken": "telegram-token",
+                        "allowedUserIds": [123456],
+                        "channels": [
+                            {"id": "private", "title": "私有", "chatId": "-1001", "enabled": True, "isDefault": True, "role": "private", "autoPush": auto_push}
+                        ],
+                        "routing": {"fallbackChannelId": "private", "releaseGroupChannelId": "private"},
+                    }
+                )
+                calls = []
+
+                async def fake_telegram_post(token, method, payload, timeout=20.0):
+                    calls.append((method, payload.get("chat_id")))
+                    if method in {"sendMessage", "sendPhoto"}:
+                        return {"message_id": 77}
+                    return {}
+
+                with patch("app.submission.telegram_post", side_effect=fake_telegram_post), \
+                        patch("app.submission.check_telegram_chat_access", AsyncMock(return_value="")), \
+                        patch("app.submission.cleanup_published_submission_history", AsyncMock(return_value="")), \
+                        patch("app.submission.cleanup_previous_submission_publications", AsyncMock(return_value="")):
+                    result = asyncio.run(
+                        submit_submission_links(
+                            store,
+                            [
+                                {
+                                    "url": "123FLCPV2$%f#1024#Renegade.Immortal.S01E01.mkv",
+                                    "cleanUrl": "123FLCPV2$%f#1024#Renegade.Immortal.S01E01.mkv",
+                                    "provider": "123fastlink",
+                                    "title": "仙逆 (2023) {tmdb-223911}",
+                                    "sourceText": "🎬：仙逆 (2023) {tmdb-223911}\n💽：1 GB\n📄：仙逆.2023.S01E01.2160p.WEB-DL.H265.mkv",
+                                    "inspection": {
+                                        "title": "仙逆 (2023) {tmdb-223911}",
+                                        "fileNames": ["仙逆.2023.S01E01.2160p.WEB-DL.H265.mkv"],
+                                        "size": "1GB",
+                                        "rawText": "仙逆.2023.S01E01.2160p.WEB-DL.H265.mkv",
+                                    },
+                                }
+                            ],
+                            "秒传链接",
+                            123456,
+                        )
+                    )
+
+                self.assertEqual(result["draftCount"], 1)
+                sent_chats = [chat for method, chat in calls if method in {"sendMessage", "sendPhoto"}]
+                if expect_published:
+                    self.assertEqual(result["publishedCount"], 1)
+                    self.assertIsNone(get_submission_draft(store, result["drafts"][0]["id"]))
+                    self.assertIn("-1001", sent_chats)
+                    self.assertNotIn(123456, sent_chats)
+                else:
+                    self.assertEqual(result["publishedCount"], 0)
+                    self.assertIsNotNone(get_submission_draft(store, result["drafts"][0]["id"]))
+                    self.assertIn(123456, sent_chats)
+                    self.assertNotIn("-1001", sent_chats)
+
     def test_fastlink_direct_push_skip_release_group_flag_controls_recognition(self):
         """油猴直投带 skipReleaseGroup 标记时客户端跳过发布组识别；不带标记维持原识别。"""
         with tempfile.TemporaryDirectory() as directory:
