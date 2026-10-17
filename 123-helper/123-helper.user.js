@@ -6983,7 +6983,10 @@
       version: "1.5.2",
       notes: [
         "整理预览的搜索框默认填作品名字，不再是那串数字编号",
-        "文件列表里原文件名带上所在文件夹的名字，只写 1、2、3 也认得出是什么"
+        "文件列表里原文件名带上所在文件夹的名字，只写 1、2、3 也认得出是什么",
+        "分享推送跑着的时候也能接着点生成二级链接，两个一起跑不用等",
+        "同时最多跑 3 个长任务，再多就自动排队",
+        "分享推送跑完不再把中途打开的秒传工具箱顶掉"
       ]
     },
     {
@@ -9434,6 +9437,10 @@
     const folderName = options.useFolderName === false ? "123FastLink_Export" : cleanPathPart(name) || "123FastLink_Export";
     return `${folderName}${date}.123fastlink.json`;
   }
+  // 长任务并发上限（维护者 2026-10-17 定）：分享推送这类非秒传长任务可以和秒传任务同时跑，
+  // 一台机器最多 3 个；到上限后新点的秒传任务才排队。秒传任务之间仍串行——它们共用同一套
+  // 进度面板与运行明细账本（fastlink.artifacts / ledger 都是单份），并发会互相覆盖。
+  var MAX_CONCURRENT_LONG_TASKS = 3;
   // 秒传任务排队的簿记部分（执行由控制器负责）：后台已有任务在跑时，新的导出/转存点下去不再被
   // 拒绝，而是按当时的输入记成一条排队意图，前一个任务收尾后依次开跑。
   function createFastlinkTaskQueue() {
@@ -26413,6 +26420,7 @@ ${end.comment}` : end.comment;
       this.selection = bridge.snapshot();
       this.commandContext = null;
       this.abortController = null;
+      this.plainTaskCount = 0;
       this.backgroundTask = null;
       this.fastlinkQueue = createFastlinkTaskQueue();
       this.toolbar = null;
@@ -27074,14 +27082,18 @@ ${end.comment}` : end.comment;
       this.abortController = null;
       this.endFastlinkLedger();
     }
-    // 秒传任务排队入口：没有后台任务在跑也没人排队就立刻开跑并把任务 Promise 返回给调用方
-    // （await 语义不变）；否则记成一条排队意图、马上提示用户，返回 null 表示本次不用等。
-    // 前一个任务收尾后由 drainFastlinkQueue 依次开跑。
+    // 秒传任务排队入口：秒传入口彼此仍串行（共用进度面板与运行明细账本，并发会互相覆盖），
+    // 但非秒传长任务（分享推送/重命名等）占着时不干等——维护者 2026-10-17 定最多同时跑
+    // MAX_CONCURRENT_LONG_TASKS 个长任务，没到上限就立刻开跑；到上限、已有排队、或秒传任务
+    // 在跑时才记成一条排队意图、马上提示用户，再由 drainFastlinkQueue 依次放行。
     queueFastlinkTask(label, run) {
-      if (!this.backgroundTask && !this.fastlinkQueue.length) return run();
+      if (!this.backgroundTask && !this.fastlinkQueue.length && this.plainTaskCount < MAX_CONCURRENT_LONG_TASKS) return run();
       const entry = this.fastlinkQueue.add(label, run);
       this.toast(`\u5DF2\u6392\u961F\u300C${entry.label}\u300D\uFF0C\u524D\u9762\u8FD8\u6709 ${this.fastlinkQueue.length - 1} \u4E2A\u4EFB\u52A1`, "info");
       this.renderTransient();
+      // 占用者是秒传后台任务时它收尾会自己通知队列；占用者是非秒传任务（没有 backgroundTask）
+      // 时没人通知，这里挂一次轮询：drainFastlinkQueue 每 2 秒重试到并发名额空出来。
+      if (!this.backgroundTask) this.scheduleFastlinkDrain(1500);
       return null;
     }
     // 收尾时机（任务完成、结果被查看或被关闭）后再跑队列；后台任务卡片没处理完就继续等
@@ -27090,8 +27102,9 @@ ${end.comment}` : end.comment;
     }
     drainFastlinkQueue() {
       if (this.backgroundTask) return;
-      // 队列与重命名/分享这些非秒传任务共用一个中止控制器，别的任务还在跑就过两秒再看
-      if (this.state.progress) {
+      // 与 queueFastlinkTask 同一把尺子：非秒传长任务没到并发上限就该放行，不必等到全空闲；
+      // 到了上限就过两秒再看（占用者收尾后名额会空出来）
+      if (this.plainTaskCount >= MAX_CONCURRENT_LONG_TASKS) {
         if (this.fastlinkQueue.length) this.scheduleFastlinkDrain(2000);
         return;
       }
@@ -27217,10 +27230,14 @@ ${end.comment}` : end.comment;
     }
     async runTask(worker, options = {}) {
       if (this.hasActiveBackgroundTask() && options.backgroundTask !== this.backgroundTask) throw new Error("\u79D2\u4F20\u540E\u53F0\u4EFB\u52A1\u6B63\u5728\u8FD0\u884C");
+      // 非秒传长任务（分享推送/重命名/整理扫描……）同样计入并发名额：秒传入口据此判断能不能立刻开跑
+      const plain = !options.backgroundTask;
+      if (plain) this.plainTaskCount += 1;
       this.abortController = new AbortController();
       try {
         return await worker(this.abortController.signal);
       } finally {
+        if (plain) this.plainTaskCount = Math.max(0, this.plainTaskCount - 1);
         this.clearProgress();
         this.renderTransient();
       }
@@ -27601,10 +27618,13 @@ ${end.comment}` : end.comment;
         this.render();
         return;
       }
-      this.state.view = "";
-      this.commandContext = null;
+      // 自动投稿是「无弹窗后台跑」的：跑完只在没人接管视图时收尾（清上下文、还焦点），
+      // 别把用户中途打开的窗口（如秒传工具箱）顶掉（维护者 2026-10-17）。
+      if (!this.state.view) {
+        this.commandContext = null;
+        this.restoreFocus();
+      }
       this.toast(`\u5DF2\u63A8\u9001 ${this.share.results.length} \u4EFD\u6295\u7A3F\u8349\u7A3F`, "success");
-      this.restoreFocus();
     }
     async openFastlink(items, currentDir, options = {}) {
       const singleFile = items.length === 1 && Number(items[0].type) !== 1;
@@ -30045,7 +30065,11 @@ ${end.comment}` : end.comment;
       if (!action) return;
       const handler = this.actionHandlers[action];
       if (!handler) return;
-      if (this.state.progress && !["cancel-task", "toggle-task-pause", "toggle-progress-ledger", "toggle-progress-minimized", "minimize-background-task", "background-task-open", "background-task-cancel", "background-task-dismiss", "fastlink-queue-clear", "fastlink-queue-remove", "stop"].includes(action)) return;
+      // 任务跑着的这段时间里，除下面白名单外的按钮点击一律静默忽略，避免并发启动别的重流程。
+      // 但秒传入口必须放行（维护者 2026-10-17：分享推送进行中点「生成二级链接（短链）」原来
+      // 一点反应都没有，就是被这道闸门吞了）——能不能立刻开跑、还是排队，交给 queueFastlinkTask
+      // 按并发名额决定；工具箱的页签切换也放行，否则任务期间连面板都翻不动。
+      if (this.state.progress && !["cancel-task", "toggle-task-pause", "toggle-progress-ledger", "toggle-progress-minimized", "minimize-background-task", "background-task-open", "background-task-cancel", "background-task-dismiss", "fastlink-export", "fastlink-import", "fastlink-secondary-generate", "fastlink-secondary-from-file", "fastlink-secondary-save-link", "library-transfer", "library-transfer-selected", "fastlink-tool", "fastlink-mode", "fastlink-queue-clear", "fastlink-queue-remove", "stop"].includes(action)) return;
       try {
         await handler(control, event);
       } catch (error) {

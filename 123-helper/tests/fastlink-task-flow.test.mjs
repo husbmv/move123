@@ -166,6 +166,21 @@ const items = () => [
   assert.ok(!runner.includes("probeDriveRoute("), "任务开始时不得再自动发探测请求");
   assert.ok(runner.includes("beginDriveRoute(this.api"), "任务开始仍应用线路（默认页面同源）");
   assert.equal((bundle.match(/this\.queueFastlinkTask\(/g) || []).length, 5, "五个秒传入口都要接队列");
+  // 分享推送（非秒传长任务）与秒传任务共用一把并发尺子：机器最多同时跑 3 个长任务，
+  // 没到上限点生成二级链接就立刻开跑（不再一点就排队），到上限才排队；排队后自己挂轮询等名额
+  // 空出来。秒传任务之间仍串行——共用进度面板与明细账本（维护者 2026-10-17）。
+  assert.ok(bundle.includes("var MAX_CONCURRENT_LONG_TASKS = 3;"), "并发上限写成常量");
+  assert.ok(bundle.includes("if (plain) this.plainTaskCount += 1;"), "非秒传长任务要计入并发名额");
+  assert.ok(bundle.includes("this.plainTaskCount < MAX_CONCURRENT_LONG_TASKS) return run();"), "非秒传长任务没到并发上限就立刻开跑");
+  assert.ok(bundle.includes("if (!this.backgroundTask) this.scheduleFastlinkDrain(1500);"), "排队后要挂轮询等占用者收尾自动开跑");
+  // 任务跑着时 handleClick 的进度闸门会静默吞掉其它 data-action 点击：走 queueFastlinkTask 的
+  // 秒传入口必须进白名单，否则「分享进行中点生成二级链接」根本没反应（维护者 2026-10-17）。
+  const gateLine = lines.find((line) => line.includes("this.state.progress && !") && line.includes(".includes(action)"));
+  assert.ok(gateLine, "应能定位到 handleClick 的进度闸门白名单");
+  for (const action of ["fastlink-export", "fastlink-import", "fastlink-secondary-generate", "fastlink-secondary-from-file", "fastlink-secondary-save-link", "library-transfer", "library-transfer-selected", "fastlink-tool", "fastlink-mode"]) {
+    assert.ok(gateLine.includes(`"${action}"`), `进度闸门白名单要放行 ${action}`);
+  }
+  console.log("ok 秒传入口不被进度闸门吞掉");
   assert.ok(bundle.includes('onArtifact: async (artifact, done) =>'), "导出要逐顶层项交付产物");
   assert.ok(bundle.includes("progressMinimized: false, progressLedgerOpen: true"), "进度明细默认展开");
   assert.equal((bundle.match(/\$\{renderFastlinkQueue\(ui\)\}/g) || []).length, 3, "队列在进度条与两个小窗状态都渲染");
