@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.5.1
+// @version      1.5.2
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -6979,6 +6979,13 @@
   // 历史版本条目不用回改（弹窗只按当前版本号取对应那一版）。机检在 changelog-notice.test.mjs。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.5.2",
+      notes: [
+        "整理预览的搜索框默认填作品名字，不再是那串数字编号",
+        "文件列表里原文件名带上所在文件夹的名字，只写 1、2、3 也认得出是什么"
+      ]
+    },
     {
       version: "1.5.1",
       notes: [
@@ -24918,10 +24925,17 @@ ${end.comment}` : end.comment;
     const cleaning = group.files.filter((file) => file.discard || file.conflictDiscard).length;
     return `<div class="media-header"><div class="media-poster">${mediaPoster(media, type, title)}</div><div class="media-copy"><div class="media-title-line"><div><h3>${escapeHtml(title)}</h3><p>${escapeHtml([fields.year || media?.year, type === "tv" ? "\u5267\u96C6" : "\u7535\u5F71", tmdbId ? `TMDB ${tmdbId}` : "", media?.voteAverage > 0 ? `\u8BC4\u5206 ${Number(media.voteAverage).toFixed(1)}` : ""].filter(Boolean).join(" \xB7 "))}</p></div><button class="button danger compact" data-action="organize-remove-group" data-group="${escapeHtml(group.id)}">${icon("trash", 14)}\u79FB\u9664\u5206\u7EC4</button></div>${media?.overview ? `<p class="media-overview">${escapeHtml(media.overview)}</p>` : group.sourceTitle !== fields.title ? `<p class="media-overview">\u6765\u6E90\uFF1A${escapeHtml(group.sourceTitle)}</p>` : ""}<div class="chip-row"><span class="chip accent">${escapeHtml(fields.category || "\u672A\u5206\u7C7B")}</span>${media?.collectionName ? `<span class="chip accent" title="TMDB \u5408\u96C6">${escapeHtml(media.collectionName)}</span>` : ""}${media?.voteAverage > 0 ? `<span class="chip success">\u2605 ${Number(media.voteAverage).toFixed(1)}</span>` : ""}<span class="chip success">${moving} \u79FB\u52A8</span>${cleaning ? `<span class="chip danger">${cleaning} \u6E05\u7406</span>` : ""}</div></div></div>`;
   }
+  // 搜索框默认填「名称」而不是 TMDB ID（维护者 2026-10-17 定）：ID 只在还没识别出标题
+  // （占位「未识别媒体」）时兜底，免得默认值是一串数字、还得先删掉才能按名字搜。
+  function organizeSearchPrefill(group) {
+    const title = String(group.fields?.title || "").trim();
+    if (title && title !== "\u672A\u8BC6\u522B\u5A92\u4F53") return title;
+    return String(group.fields?.tmdbId || "");
+  }
   function lookupPanel(ui, group) {
     const type = group.fields.mediaType === "tv" ? "tv" : "movie";
     const metadataError = ui.organize.metadataErrorByGroup?.[group.id];
-    return `<section class="detail-section"><div class="section-title"><div>${icon("search", 17)}<h4>\u5A92\u4F53\u5339\u914D</h4></div><button class="button compact" data-action="organize-probe-metadata" data-group="${escapeHtml(group.id)}">${icon("waveform", 14)}\u8BC6\u522B\u6587\u4EF6\u5143\u6570\u636E</button></div>${metadataError ? notice(metadataError, "error") : ""}<div class="lookup-row"><input id="organize-search-query" value="${escapeHtml(ui.organize.searchQueries[group.id] ?? group.fields.tmdbId ?? group.fields.title ?? "")}" placeholder="\u6807\u9898\u6216 TMDB ID"><select id="organize-search-type"><option value="movie" ${type === "movie" ? "selected" : ""}>\u7535\u5F71</option><option value="tv" ${type === "tv" ? "selected" : ""}>\u5267\u96C6</option></select><button class="button" data-action="organize-search-run" data-group="${escapeHtml(group.id)}">${icon("refresh", 15)}\u67E5\u8BE2\u56DE\u5199</button>${type === "tv" ? `<button class="button" data-action="organize-calibrate" data-group="${escapeHtml(group.id)}">${icon("wand", 15)}TMDB \u6821\u51C6</button>` : ""}</div>${candidateRail(ui, group)}</section>`;
+    return `<section class="detail-section"><div class="section-title"><div>${icon("search", 17)}<h4>\u5A92\u4F53\u5339\u914D</h4></div><button class="button compact" data-action="organize-probe-metadata" data-group="${escapeHtml(group.id)}">${icon("waveform", 14)}\u8BC6\u522B\u6587\u4EF6\u5143\u6570\u636E</button></div>${metadataError ? notice(metadataError, "error") : ""}<div class="lookup-row"><input id="organize-search-query" value="${escapeHtml(ui.organize.searchQueries[group.id] ?? organizeSearchPrefill(group))}" placeholder="\u6807\u9898\u6216 TMDB ID"><select id="organize-search-type"><option value="movie" ${type === "movie" ? "selected" : ""}>\u7535\u5F71</option><option value="tv" ${type === "tv" ? "selected" : ""}>\u5267\u96C6</option></select><button class="button" data-action="organize-search-run" data-group="${escapeHtml(group.id)}">${icon("refresh", 15)}\u67E5\u8BE2\u56DE\u5199</button>${type === "tv" ? `<button class="button" data-action="organize-calibrate" data-group="${escapeHtml(group.id)}">${icon("wand", 15)}TMDB \u6821\u51C6</button>` : ""}</div>${candidateRail(ui, group)}</section>`;
   }
   function episodePanel(ui, group) {
     if (group.fields.mediaType !== "tv") return "";
@@ -25038,10 +25052,14 @@ ${end.comment}` : end.comment;
     const suggestions = detectOrganizeSplitCandidates(group, ui.config).map((item) => notice(`疑似混入独立电影《${escapeHtml(item.reason)}》，建议单独成一个条目`, "warning", "alert", `<button class="button compact" data-action="organize-split-suggested" data-group="${escapeHtml(group.id)}" data-plan="${escapeHtml(item.key)}">${icon("scissors", 14)}分离为新条目</button>`)).join("");
     const rows = visible.map((file) => {
       const sourceName = String(file.relativePath || file.name);
+      // 「1.mkv」这种裸文件名不看上一级目录不知道整理的是什么：补上直接父目录名。
+      // relativePath 已经带这一层目录时不重复（嵌套文件的 relativePath 自带目录链）。
+      const sourceFolder = String(file.sourceFolderName || "").trim();
+      const folderPrefix = sourceFolder && !sourceName.startsWith(`${sourceFolder}/`) ? `<span class="path-folder">${escapeHtml(sourceFolder)}/</span>` : "";
       const seasonToken = file.fields.mediaType === "tv" ? seasonTokenRange(sourceName) : null;
       const editorOpen = String(ui.organize.fileFieldEditor || "") === String(file.id);
       const checked = selectedIds.has(String(file.id));
-      const row = `<div class="organize-file ${file.discard || file.conflictDiscard ? "discard" : ""}${checked ? " selected" : ""}" data-file-row="${file.id}"><div class="source-file"><span>\u539F\u6587\u4EF6\u540D</span><strong>${markSeasonEpisodeHtml(sourceName, seasonToken)}</strong>${file.fields.mediaType === "tv" ? `<small>${escapeHtml(file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6")}</small>` : ""}${episodeOptions(ui, file)}</div><label class="field name-field"><span>\u65B0\u6587\u4EF6\u540D</span><span class="name-stack"><span class="name-mirror" aria-hidden="true">${markSeasonEpisodeHtml(file.newName, file.fields.seasonEpisode)}</span><textarea rows="3" data-organize-name="${file.id}" ${file.discard ? "disabled" : ""}>${escapeHtml(file.newName)}</textarea></span></label><div class="target-file"><span>\u76EE\u6807\u8DEF\u5F84</span><strong>${markSeasonEpisodeHtml(file.targetPath, file.fields.seasonEpisode)}</strong><small class="${file.discard || file.conflictAction ? "danger" : file.matched ? "success" : ""}">${file.discard ? "\u65C1\u6302\u79FB\u5165\u56DE\u6536\u7AD9" : escapeHtml(file.conflictAction || (file.matched ? `\u5DF2\u6821\u51C6 ${file.fields.seasonEpisode}` : file.newName !== file.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8"))}</small></div><span class="row-actions"><input type="checkbox" class="organize-file-check" data-organize-file-select data-id="${escapeHtml(String(file.id))}" ${checked ? "checked" : ""} title="\u52FE\u9009\u540E\u53EF\u5206\u79BB\u4E3A\u65B0\u6761\u76EE"><button class="icon-button ${editorOpen ? "active" : ""}" data-action="organize-toggle-file-fields" data-group="${escapeHtml(group.id)}" data-file="${escapeHtml(String(file.id))}" title="\u4FEE\u6539\u6B64\u6587\u4EF6\u7684\u6280\u672F\u5B57\u6BB5">${icon("sliders", 15)}</button><button class="icon-button danger" data-action="organize-remove-file" data-group="${escapeHtml(group.id)}" data-file="${file.id}" title="\u4ECE\u672C\u6B21\u6574\u7406\u79FB\u9664">${icon("close", 15)}</button></span></div>`;
+      const row = `<div class="organize-file ${file.discard || file.conflictDiscard ? "discard" : ""}${checked ? " selected" : ""}" data-file-row="${file.id}"><div class="source-file"><span>\u539F\u6587\u4EF6\u540D</span><strong>${folderPrefix}${markSeasonEpisodeHtml(sourceName, seasonToken)}</strong>${file.fields.mediaType === "tv" ? `<small>${escapeHtml(file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6")}</small>` : ""}${episodeOptions(ui, file)}</div><label class="field name-field"><span>\u65B0\u6587\u4EF6\u540D</span><span class="name-stack"><span class="name-mirror" aria-hidden="true">${markSeasonEpisodeHtml(file.newName, file.fields.seasonEpisode)}</span><textarea rows="3" data-organize-name="${file.id}" ${file.discard ? "disabled" : ""}>${escapeHtml(file.newName)}</textarea></span></label><div class="target-file"><span>\u76EE\u6807\u8DEF\u5F84</span><strong>${markSeasonEpisodeHtml(file.targetPath, file.fields.seasonEpisode)}</strong><small class="${file.discard || file.conflictAction ? "danger" : file.matched ? "success" : ""}">${file.discard ? "\u65C1\u6302\u79FB\u5165\u56DE\u6536\u7AD9" : escapeHtml(file.conflictAction || (file.matched ? `\u5DF2\u6821\u51C6 ${file.fields.seasonEpisode}` : file.newName !== file.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8"))}</small></div><span class="row-actions"><input type="checkbox" class="organize-file-check" data-organize-file-select data-id="${escapeHtml(String(file.id))}" ${checked ? "checked" : ""} title="\u52FE\u9009\u540E\u53EF\u5206\u79BB\u4E3A\u65B0\u6761\u76EE"><button class="icon-button ${editorOpen ? "active" : ""}" data-action="organize-toggle-file-fields" data-group="${escapeHtml(group.id)}" data-file="${escapeHtml(String(file.id))}" title="\u4FEE\u6539\u6B64\u6587\u4EF6\u7684\u6280\u672F\u5B57\u6BB5">${icon("sliders", 15)}</button><button class="icon-button danger" data-action="organize-remove-file" data-group="${escapeHtml(group.id)}" data-file="${file.id}" title="\u4ECE\u672C\u6B21\u6574\u7406\u79FB\u9664">${icon("close", 15)}</button></span></div>`;
       return `${row}${editorOpen ? fileFieldsEditor(ui, group, file) : ""}`;
     }).join("");
     const seasonChips = multiSeason ? `<div class="organize-season-chips">${seasons.map(({ value, count }) => `<button class="season-chip ${seasonFilter === value ? "active" : ""}" data-action="organize-file-season" data-group="${escapeHtml(group.id)}" data-season="${escapeHtml(value)}">${escapeHtml(organizeSeasonLabel(value))}<i>${count}</i></button>`).join("")}</div>` : "";
@@ -25839,6 +25857,8 @@ ${end.comment}` : end.comment;
   .source-file,.target-file { min-width:0; display:grid; gap:5px; }
   .source-file strong,.target-file strong { display:block; min-width:0; max-width:100%; font-size:11px; line-height:1.45; font-weight:500; overflow-wrap:break-word; word-break:normal; }
   .source-file small,.target-file small { color:var(--muted); font-size:10px; }
+  /* 原文件名前面的父目录名：弱化成灰字，文件名本身仍是主体 */
+  .source-file .path-folder { color:var(--muted); font-weight:400; }
   .episode-select { min-height:30px; font-size:10px; }
   .name-field { min-width:0; }
   /* 新文件名季集高亮：镜像层显示带红字高亮的文件名，textarea 文字透明只留光标。
