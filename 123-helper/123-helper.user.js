@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.5.0
+// @version      1.5.1
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -6979,6 +6979,13 @@
   // 历史版本条目不用回改（弹窗只按当前版本号取对应那一版）。机检在 changelog-notice.test.mjs。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.5.1",
+      notes: [
+        "条目里混着的其他季或剧场版，可以勾选后单独分离出去",
+        "整理预览会自动发现疑似混入的剧场版，点一下就能分出来"
+      ]
+    },
     {
       version: "1.5.0",
       notes: [
@@ -21301,6 +21308,173 @@ ${end.comment}` : end.comment;
     }
     return groups;
   }
+  // 「强片名目录」判定：非弱标题 + 带年份或 {tmdb-N} 标记 + 不含季词。提到模块级，供
+  // 「一目录一部」容器拆分与「条目分离」检测复用（与原容器拆分的闭包谓词等价）。
+  function isStrongMovieFolderName(name, mappings) {
+    return !isWeakOrganizeFolderTitle(name, mappings)
+      && (/(?:^|[^0-9])(?:19|20)\d{2}(?:[^0-9]|$)/.test(name) || /\{\s*tmdb-?\d+\s*\}/i.test(name))
+      && seasonNumberFromText(name) === null;
+  }
+  // 条目分离：由「声明的文件集」确定性算出新条目 id（与声明顺序无关）。重扫后仍能命中按
+  // group.id 存的用户编辑（overrides/mediaByGroup/episodePlans…）。FNV-1a 32 位 → base36。
+  function organizeSplitHash(value) {
+    let hash = 2166136261;
+    const text = String(value || "");
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  }
+  function organizeSplitId(fileIds) {
+    const ids = [...new Set((fileIds || []).map((id) => String(id)))].sort();
+    return `split:${organizeSplitHash(ids.join("|"))}`;
+  }
+  // 分离出的新条目标题：全文件同属一个强片名来源目录 → 用该目录名；否则取首个非弱视频片名。
+  function splitGroupTitle(files, fallbackTitle, mappings) {
+    const list = files || [];
+    const folderNames = [...new Set(list.map((file) => String(file.sourceFolderName || "").trim()).filter(Boolean))];
+    if (folderNames.length === 1 && !isWeakOrganizeFolderTitle(folderNames[0], mappings)) {
+      const cleaned = cleanName(normalizedTitle(folderNames[0])) || folderNames[0];
+      if (cleaned && !isWeakLooseTitle(cleaned)) return cleaned;
+    }
+    for (const file of list) {
+      const title = inferTitle(String(file.relativePath || file.name || ""), mappings);
+      if (title && !isWeakLooseTitle(title)) return title;
+    }
+    return String(fallbackTitle || "").trim() || "未识别媒体";
+  }
+  // 识别层旁路：按拆分计划把文件从已有分组抽出、另立新条目。只在有有效计划时才对分组产生
+  // 影响——无计划/全失效时返回入参原数组（保证不影响既有识别结果）。必须在
+  // mergeSameEntryFolderGroups 之后调用，否则新条目会被「同 TMDB 合并」立刻并回父组。
+  function applyOrganizeSplits(groups, splitPlans, options = {}) {
+    const plans = (splitPlans || []).filter((plan) => plan && Array.isArray(plan.fileIds) && plan.fileIds.length);
+    if (!plans.length) return groups;
+    const excluded = options.excludedItemIds;
+    const isExcluded = (id) => Boolean(excluded?.has?.(String(id)) || excluded?.includes?.(String(id)));
+    const config = options.config || {};
+    const mappings = config?.library?.recognition?.fixedMappings;
+    // 浅拷贝每组、文件数组也拷贝——保持纯函数语义，不改写入参分组。
+    const next = groups.map((group) => ({ ...group, files: [...(group.files || [])] }));
+    const claimed = /* @__PURE__ */ new Set();
+    const additions = [];
+    const additionsByAnchor = /* @__PURE__ */ new Map();
+    for (const plan of plans) {
+      const wanted = new Set(plan.fileIds.map((id) => String(id)));
+      const taken = [];
+      let anchor = null;
+      for (const group of next) {
+        const kept = [];
+        for (const file of group.files) {
+          const id = String(file.id);
+          if (!claimed.has(id) && wanted.has(id) && !isExcluded(id)) {
+            claimed.add(id);
+            taken.push(file);
+            anchor ||= group;
+          } else {
+            kept.push(file);
+          }
+        }
+        group.files = kept;
+      }
+      if (!taken.length) continue;
+      const sourceFolders = [];
+      for (const folder of anchor?.sourceFolders || []) {
+        if (!sourceFolders.some((item) => String(item.id) === String(folder.id))) sourceFolders.push(folder);
+      }
+      const title = splitGroupTitle(taken, plan.title, mappings);
+      const first = taken[0];
+      const sameFolder = taken.every((file) => String(file.sourceFolderId || "") === String(first.sourceFolderId || ""));
+      const folderName = sameFolder ? String(first.sourceFolderName || "") : "";
+      for (const file of taken) {
+        // 清掉父组残留的衍生/板块标记与目标季，改由新条目重新标注，避免污染新文件名。
+        file.variantLabel = "";
+        file.sectorWord = "";
+        file.targetSeason = void 0;
+      }
+      assignFileVariantLabels(taken, title, config);
+      const seasonCandidate = folderName && !isStrongMovieFolderName(folderName, mappings) ? targetSeasonFromFolder(folderName) : null;
+      additions.push({
+        id: plan.id || organizeSplitId(plan.fileIds),
+        title,
+        files: taken,
+        sourceFolders,
+        sourceFolderId: sameFolder ? first.sourceFolderId || "" : "",
+        sourceFolderName: folderName,
+        targetSeason: Number.isInteger(seasonCandidate) && seasonCandidate > 0 ? seasonCandidate : void 0,
+        unidentified: isWeakLooseTitle(title),
+        media: void 0
+      });
+      if (anchor) {
+        if (!additionsByAnchor.has(anchor)) additionsByAnchor.set(anchor, []);
+        additionsByAnchor.get(anchor).push(additions[additions.length - 1]);
+      }
+    }
+    if (!additions.length) return groups;
+    // 新条目紧跟贡献组之后，海报墙上相邻；被抽空的父组直接丢弃。
+    const emitted = /* @__PURE__ */ new Set();
+    const result = [];
+    for (const group of next) {
+      if (group.files.length) result.push(group);
+      for (const item of additionsByAnchor.get(group) || []) {
+        result.push(item);
+        emitted.add(item);
+      }
+    }
+    for (const item of additions) if (!emitted.has(item)) result.push(item);
+    return result;
+  }
+  // 检测「一个条目里疑似混入剧场版/独立电影」——只做提示，绝不改变分组。返回候选数组，
+  // 每项 { key, title, fileIds, reason }，key 即分离计划 id。
+  var ORGANIZE_SPLIT_SPECIAL_FOLDER = /^(?:SPs?|Specials?|OVA|OAD|NCOP|NCED|特典|特輯|特辑|特別篇|特别篇|花絮|番外|衍生|预告|預告)/i;
+  var ORGANIZE_SPLIT_MOVIE_KEYWORD = /剧场版|劇場版|剧场|劇場|电影版|電影版|The\s*Movie|\bMovie\b/i;
+  function detectOrganizeSplitCandidates(group, config = {}) {
+    const files = (group?.files || []).filter((file) => isVideoFile(file.name));
+    if (files.length < 2) return [];
+    const type = group?.media?.mediaType || group?.fields?.mediaType || "";
+    if (type === "movie") return [];
+    const mappings = config?.library?.recognition?.fixedMappings;
+    const hasEpisodeMark = files.some((file) => fileHasExplicitSeasonEpisode(file));
+    const seasons = new Set(files.map((file) => String(file.fields?.season ?? "").trim()).filter(Boolean));
+    // 组得像剧集才谈得上「混入」：有显式季集标记、或多季、或已按剧集匹配。
+    if (!hasEpisodeMark && seasons.size < 2 && type !== "tv") return [];
+    const total = (group?.files || []).length;
+    const haveYear = (value) => /(?:^|[^0-9])(?:19|20)\d{2}(?:[^0-9]|$)/.test(value);
+    const candidates = [];
+    const claimedIds = /* @__PURE__ */ new Set();
+    const push = (list, reason) => {
+      const ids = list.map((file) => String(file.id));
+      if (!ids.length || list.length >= total || ids.some((id) => claimedIds.has(id))) return;
+      ids.forEach((id) => claimedIds.add(id));
+      candidates.push({ key: organizeSplitId(ids), title: splitGroupTitle(list, reason, mappings), fileIds: ids, reason });
+    };
+    // 通道一：来源子目录是「强片名目录」且其视频都不带季集标记 → 整个目录（含侧车）抽出去。
+    const clusters = /* @__PURE__ */ new Map();
+    for (const file of files) {
+      const key = String(file.sourceFolderId || file.sourceFolderName || "");
+      if (!key) continue;
+      if (!clusters.has(key)) clusters.set(key, []);
+      clusters.get(key).push(file);
+    }
+    for (const [key, cluster] of clusters) {
+      const folderName = String(cluster[0]?.sourceFolderName || "");
+      if (!folderName || ORGANIZE_SPLIT_SPECIAL_FOLDER.test(normalizedTitle(folderName))) continue;
+      if (cluster.some((file) => fileHasExplicitSeasonEpisode(file))) continue;
+      if (!isStrongMovieFolderName(folderName, mappings) && !(ORGANIZE_SPLIT_MOVIE_KEYWORD.test(normalizedTitle(folderName)) && haveYear(folderName))) continue;
+      push((group.files || []).filter((file) => String(file.sourceFolderId || "") === key), folderName);
+    }
+    // 通道二：正片目录里混入的独立电影文件（文件名带剧场版关键词 + 年份 + 无集号）。
+    // 仅在组内确有显式季集正片时才报——否则「整组都是电影文件」会被误判成混入。
+    if (hasEpisodeMark) {
+      for (const file of files) {
+        if (fileHasExplicitSeasonEpisode(file)) continue;
+        const name = normalizedTitle(file.relativePath || file.name);
+        if (!ORGANIZE_SPLIT_MOVIE_KEYWORD.test(name) || !haveYear(name)) continue;
+        push([file], file.name);
+      }
+    }
+    return candidates;
+  }
   async function collectOrganizeGroups(api, items, config, options = {}) {
     const groups = [];
     const loose = [];
@@ -21315,10 +21489,7 @@ ${end.comment}` : end.comment;
         // Shrek 2001），整棵树含全部续作都被改名成第一部——按强片名子目录各成一组、
         // 各认各的；校验不过的子目录文件落回散文件分组（还有目录名兜底分组托底）。
         const childFolders = scanned.sourceFolders.filter((folder) => Number(folder.depth) === 1 && folder.id && folder.name);
-        const isStrongChildFolder = (name) => !isWeakOrganizeFolderTitle(name, mappings)
-          && (/(?:^|[^0-9])(?:19|20)\d{2}(?:[^0-9]|$)/.test(name) || /\{\s*tmdb-?\d+\s*\}/i.test(name))
-          && seasonNumberFromText(name) === null;
-        const strongChildren = childFolders.filter((folder) => isStrongChildFolder(folder.name));
+        const strongChildren = childFolders.filter((folder) => isStrongMovieFolderName(folder.name, mappings));
         if (strongChildren.length >= 2) {
           const claimed = /* @__PURE__ */ new Set();
           for (const child of strongChildren) {
@@ -22163,8 +22334,11 @@ ${end.comment}` : end.comment;
   async function buildOrganizePreview(api, tmdb, items, config, options = {}) {
     const warnings = [];
     const groups = await collectOrganizeGroups(api, items, config, { ...options, tmdb, warnings });
+    // 条目分离：必须在这一步（collectOrganizeGroups，含 mergeSameEntryFolderGroups 合并）之后
+    // 应用，否则新条目会被「同 TMDB 合并」立刻并回父组。无拆分计划时原样返回，不影响既有识别。
+    const splitGroups = applyOrganizeSplits(groups, options.splitPlans, { excludedItemIds: options.excludedItemIds, config });
     const excludedGroups = options.excludedGroupIds || /* @__PURE__ */ new Set();
-    const activeGroups = groups.filter((group) => !(excludedGroups.has?.(group.id) || excludedGroups.includes?.(group.id)));
+    const activeGroups = splitGroups.filter((group) => !(excludedGroups.has?.(group.id) || excludedGroups.includes?.(group.id)));
     // AI 兜底识别先打包预取：识别阶段开始前把「本地认不出片名」的组批量问一次 AI（每批一次请求，
     // 而不是每组一次），结果写回 options 供 resolveMedia 直接取用；未识别组多时省调用、省费用、也更快。
     if (aiAssistReady(tmdb, options) && options.aiBatchRecognition !== false) {
@@ -24857,15 +25031,21 @@ ${end.comment}` : end.comment;
     const pages = Math.max(1, Math.ceil(list.length / ORGANIZE_FILE_PAGE_SIZE));
     const page = Math.min(Math.max(1, Number(ui.organize.filePages?.[group.id]) || 1), pages);
     const visible = list.slice((page - 1) * ORGANIZE_FILE_PAGE_SIZE, page * ORGANIZE_FILE_PAGE_SIZE);
+    const selectedIds = ui.organize.selectedFileIds || /* @__PURE__ */ new Set();
+    const selectedCount = group.files.filter((file) => selectedIds.has(String(file.id))).length;
+    const splitDisabled = selectedCount === 0 || selectedCount >= group.files.length;
+    const splitBar = `<div class="organize-split-bar"><span>已勾选 <strong>${selectedCount}</strong> / 共 ${group.files.length} 项</span><div class="button-row"><button class="button compact" data-action="organize-split-selected" data-group="${escapeHtml(group.id)}" ${splitDisabled ? "disabled" : ""}>${icon("scissors", 14)}分离为新条目</button><button class="button compact" data-action="organize-split-clear" data-group="${escapeHtml(group.id)}" ${selectedCount ? "" : "disabled"}>清空勾选</button></div></div>`;
+    const suggestions = detectOrganizeSplitCandidates(group, ui.config).map((item) => notice(`疑似混入独立电影《${escapeHtml(item.reason)}》，建议单独成一个条目`, "warning", "alert", `<button class="button compact" data-action="organize-split-suggested" data-group="${escapeHtml(group.id)}" data-plan="${escapeHtml(item.key)}">${icon("scissors", 14)}分离为新条目</button>`)).join("");
     const rows = visible.map((file) => {
       const sourceName = String(file.relativePath || file.name);
       const seasonToken = file.fields.mediaType === "tv" ? seasonTokenRange(sourceName) : null;
       const editorOpen = String(ui.organize.fileFieldEditor || "") === String(file.id);
-      const row = `<div class="organize-file ${file.discard || file.conflictDiscard ? "discard" : ""}" data-file-row="${file.id}"><div class="source-file"><span>\u539F\u6587\u4EF6\u540D</span><strong>${markSeasonEpisodeHtml(sourceName, seasonToken)}</strong>${file.fields.mediaType === "tv" ? `<small>${escapeHtml(file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6")}</small>` : ""}${episodeOptions(ui, file)}</div><label class="field name-field"><span>\u65B0\u6587\u4EF6\u540D</span><span class="name-stack"><span class="name-mirror" aria-hidden="true">${markSeasonEpisodeHtml(file.newName, file.fields.seasonEpisode)}</span><textarea rows="3" data-organize-name="${file.id}" ${file.discard ? "disabled" : ""}>${escapeHtml(file.newName)}</textarea></span></label><div class="target-file"><span>\u76EE\u6807\u8DEF\u5F84</span><strong>${markSeasonEpisodeHtml(file.targetPath, file.fields.seasonEpisode)}</strong><small class="${file.discard || file.conflictAction ? "danger" : file.matched ? "success" : ""}">${file.discard ? "\u65C1\u6302\u79FB\u5165\u56DE\u6536\u7AD9" : escapeHtml(file.conflictAction || (file.matched ? `\u5DF2\u6821\u51C6 ${file.fields.seasonEpisode}` : file.newName !== file.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8"))}</small></div><span class="row-actions"><button class="icon-button ${editorOpen ? "active" : ""}" data-action="organize-toggle-file-fields" data-group="${escapeHtml(group.id)}" data-file="${escapeHtml(String(file.id))}" title="\u4FEE\u6539\u6B64\u6587\u4EF6\u7684\u6280\u672F\u5B57\u6BB5">${icon("sliders", 15)}</button><button class="icon-button danger" data-action="organize-remove-file" data-group="${escapeHtml(group.id)}" data-file="${file.id}" title="\u4ECE\u672C\u6B21\u6574\u7406\u79FB\u9664">${icon("close", 15)}</button></span></div>`;
+      const checked = selectedIds.has(String(file.id));
+      const row = `<div class="organize-file ${file.discard || file.conflictDiscard ? "discard" : ""}${checked ? " selected" : ""}" data-file-row="${file.id}"><div class="source-file"><span>\u539F\u6587\u4EF6\u540D</span><strong>${markSeasonEpisodeHtml(sourceName, seasonToken)}</strong>${file.fields.mediaType === "tv" ? `<small>${escapeHtml(file.fields.seasonEpisode || "\u672A\u8BC6\u522B\u5B63\u96C6")}</small>` : ""}${episodeOptions(ui, file)}</div><label class="field name-field"><span>\u65B0\u6587\u4EF6\u540D</span><span class="name-stack"><span class="name-mirror" aria-hidden="true">${markSeasonEpisodeHtml(file.newName, file.fields.seasonEpisode)}</span><textarea rows="3" data-organize-name="${file.id}" ${file.discard ? "disabled" : ""}>${escapeHtml(file.newName)}</textarea></span></label><div class="target-file"><span>\u76EE\u6807\u8DEF\u5F84</span><strong>${markSeasonEpisodeHtml(file.targetPath, file.fields.seasonEpisode)}</strong><small class="${file.discard || file.conflictAction ? "danger" : file.matched ? "success" : ""}">${file.discard ? "\u65C1\u6302\u79FB\u5165\u56DE\u6536\u7AD9" : escapeHtml(file.conflictAction || (file.matched ? `\u5DF2\u6821\u51C6 ${file.fields.seasonEpisode}` : file.newName !== file.name ? "\u91CD\u547D\u540D\u5E76\u79FB\u52A8" : "\u79FB\u52A8"))}</small></div><span class="row-actions"><input type="checkbox" class="organize-file-check" data-organize-file-select data-id="${escapeHtml(String(file.id))}" ${checked ? "checked" : ""} title="\u52FE\u9009\u540E\u53EF\u5206\u79BB\u4E3A\u65B0\u6761\u76EE"><button class="icon-button ${editorOpen ? "active" : ""}" data-action="organize-toggle-file-fields" data-group="${escapeHtml(group.id)}" data-file="${escapeHtml(String(file.id))}" title="\u4FEE\u6539\u6B64\u6587\u4EF6\u7684\u6280\u672F\u5B57\u6BB5">${icon("sliders", 15)}</button><button class="icon-button danger" data-action="organize-remove-file" data-group="${escapeHtml(group.id)}" data-file="${file.id}" title="\u4ECE\u672C\u6B21\u6574\u7406\u79FB\u9664">${icon("close", 15)}</button></span></div>`;
       return `${row}${editorOpen ? fileFieldsEditor(ui, group, file) : ""}`;
     }).join("");
     const seasonChips = multiSeason ? `<div class="organize-season-chips">${seasons.map(({ value, count }) => `<button class="season-chip ${seasonFilter === value ? "active" : ""}" data-action="organize-file-season" data-group="${escapeHtml(group.id)}" data-season="${escapeHtml(value)}">${escapeHtml(organizeSeasonLabel(value))}<i>${count}</i></button>`).join("")}</div>` : "";
-    return `<section class="detail-section file-section"><div class="section-title"><div>${icon("list", 17)}<h4>\u6587\u4EF6\u4E0E\u76EE\u6807\u8DEF\u5F84</h4></div><span>${group.files.length} \u9879</span></div>${seasonChips}<div class="organize-files">${rows}</div>${organizePager("organize-file-page", page, list.length, ORGANIZE_FILE_PAGE_SIZE)}</section>`;
+    return `<section class="detail-section file-section"><div class="section-title"><div>${icon("list", 17)}<h4>\u6587\u4EF6\u4E0E\u76EE\u6807\u8DEF\u5F84</h4></div><span>${group.files.length} \u9879</span></div>${splitBar}${suggestions}${seasonChips}<div class="organize-files">${rows}</div>${organizePager("organize-file-page", page, list.length, ORGANIZE_FILE_PAGE_SIZE)}</section>`;
   }
   function detailPane(ui, group) {
     if (!group) return emptyState("folder", "\u6CA1\u6709\u53EF\u6574\u7406\u7684\u5A92\u4F53\u6587\u4EF6", "\u8FD4\u56DE\u6587\u4EF6\u5217\u8868\u91CD\u65B0\u9009\u62E9\u540E\u518D\u8BD5");
@@ -25650,6 +25830,11 @@ ${end.comment}` : end.comment;
   .icon-button.active { color:var(--accent); border-color:var(--accent); }
   .compact-rows .organize-file { padding-block:7px; }
   .organize-file:last-child { border-bottom:0; } .organize-file.discard { background:var(--danger-soft); }
+  .organize-file.selected { background:var(--accent-soft); }
+  .organize-file-check { flex:0 0 auto; margin:0; align-self:center; }
+  .organize-split-bar { display:flex; align-items:center; flex-wrap:wrap; gap:8px 12px; padding:9px 13px; color:var(--muted); font-size:11px; background:var(--surface-2); border-bottom:1px solid color-mix(in srgb,var(--glass-border) 72%,transparent); }
+  .organize-split-bar > span { color:var(--muted); } .organize-split-bar > span strong { color:var(--text); }
+  .organize-split-bar .button-row { margin-left:auto; }
   .organize-file:hover { background:var(--accent-soft); }
   .source-file,.target-file { min-width:0; display:grid; gap:5px; }
   .source-file strong,.target-file strong { display:block; min-width:0; max-width:100%; font-size:11px; line-height:1.45; font-weight:500; overflow-wrap:break-word; word-break:normal; }
@@ -28067,7 +28252,8 @@ ${end.comment}` : end.comment;
         fileOverrides: this.organize.fileOverrides,
         excludedGroupIds: this.organize.excludedGroupIds,
         excludedItemIds: this.organize.excludedItemIds,
-        manualNames: this.organize.manualNames
+        manualNames: this.organize.manualNames,
+        splitPlans: this.organize.splitPlans
       };
     }
     async openOrganize(items, currentDir, options = {}) {
@@ -28109,6 +28295,8 @@ ${end.comment}` : end.comment;
         collectionByGroup: {},
         strategyDialog: null,
         manualNames: {},
+        splitPlans: [],
+        selectedFileIds: /* @__PURE__ */ new Set(),
         previewRequestId: 0,
         excludedGroupIds: /* @__PURE__ */ new Set(),
         excludedItemIds: /* @__PURE__ */ new Set(),
@@ -28679,6 +28867,10 @@ ${end.comment}` : end.comment;
     }
     removeOrganizeGroup(groupId) {
       this.organize.excludedGroupIds.add(groupId);
+      // 被删的若是分离出来的新条目，同步撤掉它的拆分计划与勾选残留，免得重扫后复活。
+      const removed = this.organize.preview?.groups.find((item) => item.id === groupId);
+      for (const file of removed?.files || []) this.organize.selectedFileIds?.delete(String(file.id));
+      this.organize.splitPlans = (this.organize.splitPlans || []).filter((plan) => plan.id !== groupId);
       this.organize.preview.groups = this.organize.preview.groups.filter((group) => group.id !== groupId);
       this.organize.preview.tasks = this.organize.preview.tasks.filter((task) => task.groupId !== groupId);
       delete this.organize.episodePlans[groupId];
@@ -28701,6 +28893,59 @@ ${end.comment}` : end.comment;
       if (group && !group.files.length) return this.removeOrganizeGroup(groupId);
       this.refreshOrganizeSummary();
       this.render();
+    }
+    clearOrganizeFileSelection(groupId) {
+      const group = this.organize.preview?.groups.find((item) => item.id === groupId);
+      for (const file of group?.files || []) this.organize.selectedFileIds.delete(String(file.id));
+      this.render();
+    }
+    // 记下一条拆分计划，返回新条目 id。计划按「声明的文件集」确定性取名，重扫后仍命中
+    // 按 group.id 存的用户编辑（overrides/mediaByGroup/episodePlans…）。
+    applyOrganizeSplit(fileIds, title = "") {
+      const ids = [...new Set((fileIds || []).map((id) => String(id)))];
+      if (!ids.length) return "";
+      const id = organizeSplitId(ids);
+      this.organize.splitPlans = [...(this.organize.splitPlans || []).filter((plan) => plan.id !== id), { id, title: String(title || ""), fileIds: ids }];
+      for (const item of ids) this.organize.selectedFileIds.delete(item);
+      return id;
+    }
+    async runOrganizeSplit(fileIds, title = "") {
+      const newId = this.applyOrganizeSplit(fileIds, title);
+      if (!newId) return;
+      this.toast("已分离，正在重新识别新条目…", "info");
+      await this.generateOrganizePreview();
+      const groups = this.organize.preview?.groups || [];
+      const index = groups.findIndex((group) => group.id === newId);
+      if (index >= 0) {
+        this.organize.selectedGroupId = newId;
+        this.organize.groupPage = Math.floor(index / ORGANIZE_GROUP_PAGE_SIZE) + 1;
+        this.organize.filePages[newId] = 1;
+      }
+      this.render();
+    }
+    async splitOrganizeSelection(groupId) {
+      const group = this.organize.preview?.groups.find((item) => item.id === groupId);
+      if (!group) return;
+      const ids = (group.files || []).map((file) => String(file.id)).filter((id) => this.organize.selectedFileIds.has(id));
+      if (!ids.length) {
+        this.toast("请先勾选要分离的文件", "warning");
+        return;
+      }
+      if (ids.length >= (group.files || []).length) {
+        this.toast("至少要留下一个文件在原条目里", "warning");
+        return;
+      }
+      await this.runOrganizeSplit(ids);
+    }
+    async splitOrganizeSuggested(groupId, planKey) {
+      const group = this.organize.preview?.groups.find((item) => item.id === groupId);
+      if (!group) return;
+      const candidate = detectOrganizeSplitCandidates(group, this.config).find((item) => item.key === planKey);
+      if (!candidate) {
+        this.toast("该建议已失效，请重新生成预览", "warning");
+        return;
+      }
+      await this.runOrganizeSplit(candidate.fileIds, candidate.title);
     }
     openSettings(tab = "general", options = {}) {
       this.previousFocus ||= document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -29307,6 +29552,9 @@ ${end.comment}` : end.comment;
         },
         "organize-remove-group": (control) => this.removeOrganizeGroup(control.dataset.group),
         "organize-remove-file": (control) => this.removeOrganizeFile(control.dataset.group, control.dataset.file),
+        "organize-split-selected": (control) => this.splitOrganizeSelection(control.dataset.group),
+        "organize-split-clear": (control) => this.clearOrganizeFileSelection(control.dataset.group),
+        "organize-split-suggested": (control) => this.splitOrganizeSuggested(control.dataset.group, control.dataset.plan),
         "organize-toggle-file-fields": (control) => {
           const fileId = String(control.dataset.file || "");
           this.organize.fileFieldEditor = this.organize.fileFieldEditor === fileId ? "" : fileId;
@@ -29820,6 +30068,13 @@ ${end.comment}` : end.comment;
           if (target.checked) this.cleaner.selectedIds.add(id);
           else this.cleaner.selectedIds.delete(id);
           this.render();
+          return;
+        }
+        if (target.dataset.organizeFileSelect !== void 0 && target.dataset.id && this.organize?.preview) {
+          const id = String(target.dataset.id);
+          if (target.checked) this.organize.selectedFileIds.add(id);
+          else this.organize.selectedFileIds.delete(id);
+          this.refreshOrganizeSurface({ detailOnly: true });
           return;
         }
         if (target.dataset.planField && target.dataset.planGroup) {

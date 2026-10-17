@@ -27,14 +27,15 @@ globalThis.__organize = {
   applyVariantTagsForCollisions, parseSeasonEpisode, specialContext, isVideoFile, collectOrganizeGroups,
   inferFields, inferFileFields, refreshOrganizeGroupTargets, fileHasExplicitSeasonEpisode,
   tmdbCandidateHasExactTitle, titleExtraWords, assignFileVariantLabels,
-  matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, rawSectorWord, fileSectorWord
+  matchEpisodeCandidates, filterEpisodeCandidatesForTargetSeason, rawSectorWord, fileSectorWord,
+  applyOrganizeSplits, detectOrganizeSplitCandidates, organizeSplitId, isStrongMovieFolderName
 };
 `;
 const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, DOMException };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
 const { buildLooseGroups, stripLooseEpisodeTail, looseGroupBaseTitle, looseVariantRemainder, organizeVariantTag, injectNameVariant, synthesizeEpisodeCandidatesFromNames, applyVariantTagsForCollisions, inferTitle, parseSeasonEpisode, collectOrganizeGroups, inferFields, inferFileFields, refreshOrganizeGroupTargets, fileHasExplicitSeasonEpisode, tmdbCandidateHasExactTitle, titleExtraWords, assignFileVariantLabels, matchEpisodeCandidates,
-  filterEpisodeCandidatesForTargetSeason, rawSectorWord, fileSectorWord } = sandbox.__organize;
+  filterEpisodeCandidatesForTargetSeason, rawSectorWord, fileSectorWord, applyOrganizeSplits, detectOrganizeSplitCandidates, organizeSplitId, isStrongMovieFolderName } = sandbox.__organize;
 
 const config = { library: { recognition: { customWords: [] } } };
 const file = (name, id = name) => ({ id, name });
@@ -214,6 +215,175 @@ test("同剧各 part 文件归入同一分组，分组标题不带分段标记",
   ], config);
   assert.equal(groups.length, 1);
   assert.ok(!groups[0].title.includes("部分"), `分组标题不应残留分段标记：${groups[0].title}`);
+});
+
+// —— 条目分离：多季 + 剧场版拆成独立条目（维护者 2026-10-17 定） ——
+const splitFile = (id, name, folderId, folderName) => ({ id, name, relativePath: name, sourceFolderId: folderId, sourceFolderName: folderName });
+const MOVIE_FOLDER = "进击的巨人 剧场版 (2020)";
+const makeMixedGroup = () => ({
+  id: "folder:top",
+  title: "进击的巨人",
+  sourceFolderId: "top",
+  sourceFolderName: "进击的巨人",
+  sourceFolders: [{ id: "top", name: "进击的巨人", depth: 0 }],
+  files: [
+    splitFile("s1e1", "进击的巨人.S01E01.1080p.mkv", "f-se1", "Season 1"),
+    splitFile("s2e1", "进击的巨人.S02E01.1080p.mkv", "f-se2", "Season 2"),
+    splitFile("mv1", "进击的巨人 剧场版 (2020).2160p.mkv", "f-mv", MOVIE_FOLDER),
+    splitFile("mv2", "cover.jpg", "f-mv", MOVIE_FOLDER)
+  ]
+});
+
+test("organizeSplitId 与声明顺序无关且可复现", () => {
+  const a = organizeSplitId(["mv1", "mv2"]);
+  assert.equal(a, organizeSplitId(["mv2", "mv1"]), "顺序无关");
+  assert.equal(a, organizeSplitId(["mv2", "mv1", "mv1"]), "去重后一致");
+  assert.match(a, /^split:/);
+});
+
+test("applyOrganizeSplits：多季组里的剧场版抽成独立条目，父组只留季文件", () => {
+  const groups = [makeMixedGroup()];
+  const out = applyOrganizeSplits(groups, [{ id: "split:mv", title: "", fileIds: ["mv1", "mv2"] }], { config });
+  assert.equal(out.length, 2, `应拆成两组，实际 ${out.length}`);
+  const parent = out.find((g) => g.id === "folder:top");
+  const child = out.find((g) => g.id === "split:mv");
+  assert.ok(parent && child, "父组与新条目都在");
+  assert.deepEqual([...parent.files].map((f) => f.id), ["s1e1", "s2e1"]);
+  assert.deepEqual([...child.files].map((f) => f.id), ["mv1", "mv2"]);
+  assert.ok(!child.media, "新条目不复制父组 TMDB 匹配，各自重新匹配");
+  assert.ok(child.title.includes("剧场版"), `新条目标题取自子目录名：${child.title}`);
+  assert.ok(child.sourceFolders.some((folder) => folder.id === "top"), "新条目继承来源目录（供清理）");
+  assert.equal(groups[0].files.length, 4, "入参分组未被改动（纯函数）");
+});
+
+test("applyOrganizeSplits：父组文件被全部抽走时直接丢弃", () => {
+  const groups = [{ id: "loose:x", title: "剧", files: [splitFile("a", "剧.S01E01.mkv", "f1", "剧")], sourceFolders: [] }];
+  const out = applyOrganizeSplits(groups, [{ id: "split:all", title: "", fileIds: ["a"] }], { config });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].id, "split:all");
+});
+
+test("applyOrganizeSplits：fileIds 全找不到时原样返回且不改入参", () => {
+  const groups = [makeMixedGroup()];
+  const out = applyOrganizeSplits(groups, [{ id: "split:ghost", title: "", fileIds: ["zzz"] }], { config });
+  assert.equal(out, groups, "返回同一个数组引用");
+  assert.equal(groups[0].files.length, 4, "入参分组未被改动");
+});
+
+test("applyOrganizeSplits：没有拆分计划时零影响既有识别（引用相等）", () => {
+  const groups = [makeMixedGroup()];
+  assert.equal(applyOrganizeSplits(groups, [], { config }), groups);
+  assert.equal(applyOrganizeSplits(groups, void 0, { config }), groups);
+});
+
+test("applyOrganizeSplits：部分命中仍按声明文件集取名，只抽命中文件", () => {
+  const groups = [makeMixedGroup()];
+  const declared = ["mv1", "mv2", "missing"];
+  const out = applyOrganizeSplits(groups, [{ title: "", fileIds: declared }], { config });
+  const child = out.find((g) => g.id === organizeSplitId(declared));
+  assert.ok(child, "id 按声明集合算，云盘少文件也不换 id");
+  assert.deepEqual([...child.files].map((f) => f.id), ["mv1", "mv2"]);
+});
+
+test("applyOrganizeSplits：重叠/重复计划不产生重复文件", () => {
+  const groups = [makeMixedGroup()];
+  const out = applyOrganizeSplits(groups, [
+    { id: "split:a", fileIds: ["mv1", "mv2"] },
+    { id: "split:b", fileIds: ["mv2"] }
+  ], { config });
+  const all = out.flatMap((g) => g.files.map((f) => f.id));
+  assert.equal(all.length, 4, "四个文件一个不漏、一个不重");
+  assert.equal(new Set(all).size, 4);
+  assert.ok(!out.some((g) => g.id === "split:b"), "第二个计划抽不到文件就不建组");
+});
+
+test("applyOrganizeSplits：被移除（excludedItemIds）的文件不参与拆分", () => {
+  const groups = [makeMixedGroup()];
+  const out = applyOrganizeSplits(groups, [{ id: "split:mv", fileIds: ["mv1", "mv2"] }], { config, excludedItemIds: new Set(["mv1"]) });
+  const child = out.find((g) => g.id === "split:mv");
+  const parent = out.find((g) => g.id === "folder:top");
+  assert.ok(child, "仍能建新条目");
+  assert.deepEqual([...child.files].map((f) => f.id), ["mv2"], "被移除的文件不被抽出");
+  assert.ok([...parent.files].some((f) => f.id === "mv1"), "被移除的文件留在父组（清理走另一路径）");
+});
+
+test("isStrongMovieFolderName：带年份/标记的强片名目录才算", () => {
+  assert.equal(isStrongMovieFolderName(MOVIE_FOLDER), true);
+  assert.equal(isStrongMovieFolderName("三体 (2023) {tmdb-808}"), true);
+  assert.equal(isStrongMovieFolderName("Season 2"), false, "季目录不算");
+  assert.equal(isStrongMovieFolderName("下载"), false, "弱标题不算");
+  assert.equal(isStrongMovieFolderName("剧场版"), false, "没年份/标记不算");
+});
+
+// —— 自动提示：识别疑似混入剧场版/独立电影的条目（只提示，不改分组） ——
+const splitPreviewFile = (id, name, folderId, folderName, season = "") => ({ id, name, relativePath: name, sourceFolderId: folderId, sourceFolderName: folderName, fields: { mediaType: "tv", season } });
+
+test("detectOrganizeSplitCandidates：多季组 + 剧场版子目录 → 报一个候选", () => {
+  const group = {
+    id: "folder:top", sourceTitle: "进击的巨人",
+    media: { id: 1, mediaType: "tv" }, fields: { mediaType: "tv" },
+    files: [
+      splitPreviewFile("s1e1", "进击的巨人.S01E01.1080p.mkv", "f-se1", "Season 1"),
+      splitPreviewFile("s2e1", "进击的巨人.S02E01.1080p.mkv", "f-se2", "Season 2"),
+      splitPreviewFile("mv1", "进击的巨人 剧场版 (2020).2160p.mkv", "f-mv", MOVIE_FOLDER),
+      splitPreviewFile("mv2", "cover.jpg", "f-mv", MOVIE_FOLDER)
+    ]
+  };
+  const list = detectOrganizeSplitCandidates(group, config);
+  assert.equal(list.length, 1, `应报一个候选，实际 ${list.length}`);
+  assert.deepEqual([...list[0].fileIds].sort(), ["mv1", "mv2"]);
+  assert.equal(list[0].key, organizeSplitId(["mv1", "mv2"]));
+  assert.equal(group.files.length, 4, "只读：不改分组");
+});
+
+test("detectOrganizeSplitCandidates：同一季目录里混入的剧场版文件也算候选", () => {
+  const group = {
+    id: "folder:top", sourceTitle: "进击的巨人",
+    media: { id: 1, mediaType: "tv" }, fields: { mediaType: "tv" },
+    files: [
+      splitPreviewFile("ep1", "进击的巨人.S01E01.1080p.mkv", "f-s1", "Season 1"),
+      splitPreviewFile("mv", "进击的巨人 剧场版 (2020).2160p.mkv", "f-s1", "Season 1")
+    ]
+  };
+  const list = detectOrganizeSplitCandidates(group, config);
+  assert.equal(list.length, 1);
+  assert.deepEqual([...list[0].fileIds], ["mv"]);
+});
+
+test("detectOrganizeSplitCandidates：特典/纯电影/整组候选不误报", () => {
+  const special = {
+    id: "g1", media: { mediaType: "tv" }, fields: { mediaType: "tv" },
+    files: [
+      splitPreviewFile("e1", "剧.S01E01.mkv", "f-se", "Season 1"),
+      splitPreviewFile("sp", "剧.SP.1080p.mkv", "f-sp", "SPs"),
+      splitPreviewFile("nc", "剧.NCOP.1080p.mkv", "f-nc", "NCOP")
+    ]
+  };
+  assert.equal(detectOrganizeSplitCandidates(special, config).length, 0, "特典目录不报");
+  const movie = {
+    id: "g2", media: { mediaType: "movie" }, fields: { mediaType: "movie" },
+    files: [
+      splitPreviewFile("m1", "XXXX 剧场版 (2020).1080p.mkv", "f", "XXXX 剧场版 (2020)"),
+      splitPreviewFile("m2", "XXXX 剧场版 (2020).2160p.mkv", "f", "XXXX 剧场版 (2020)")
+    ]
+  };
+  assert.equal(detectOrganizeSplitCandidates(movie, config).length, 0, "纯电影组不报");
+  const whole = {
+    id: "g3", media: { mediaType: "tv" }, fields: { mediaType: "tv" },
+    files: [
+      splitPreviewFile("a", "剧 剧场版 (2020).part1.mkv", "f", "剧 剧场版 (2020)"),
+      splitPreviewFile("b", "剧 剧场版 (2020).part2.mkv", "f", "剧 剧场版 (2020)")
+    ]
+  };
+  assert.equal(detectOrganizeSplitCandidates(whole, config).length, 0, "候选=整组文件时不报");
+  const variety = {
+    id: "g4", media: { id: 261471, mediaType: "tv" }, fields: { mediaType: "tv" },
+    files: [
+      splitPreviewFile("v1", "初入职场.中医季.S05E01.2160p.mkv", "f", "初入职场·中医季 S03"),
+      splitPreviewFile("v2", "初入职场.中医季.药食同源.S05E01.2160p.mkv", "f", "初入职场·中医季 S03")
+    ]
+  };
+  assert.equal(detectOrganizeSplitCandidates(variety, config).length, 0, "衍生板块不误报");
 });
 
 await chain;
