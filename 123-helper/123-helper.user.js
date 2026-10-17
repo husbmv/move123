@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         123 助手
 // @namespace    local.123-helper
-// @version      1.4.11
+// @version      1.5.0
 // @description  增强 123 云盘网页端与公开分享页的文件、分享与秒传管理：批量重命名、TMDB 媒体整理、文件清理、秒传工具箱（导出 / 转存 / 二级秒传 / 拆分互转 / 影库搜索）、批量分享与投稿推送、登录会话跨浏览器复用。完整功能与使用说明见项目 README。
 // @license      MIT
 // @icon         https://statics.123957.com/static-by-custom/favicon.ico
@@ -3046,6 +3046,9 @@
     requests: { writeConcurrency: 10, retryAttempts: 6, moveInterval: 120, moveBatchSize: 100 },
     organize: { setupCompleted: false },
     tmdb: { credential: "", language: "zh-CN", region: "CN", apiBase: "", showAllSpecials: false },
+    // AI 辅助识别（OpenAI 兼容接口）：脚本认不出片名、或在多条同名片里挑错时兜底，
+    // 只做「片名归一化 / 候选重排」这类语义判断，TMDB 条目仍由脚本自己去查、去校验。
+    ai: { enabled: false, credential: "", apiBase: "https://api.deepseek.com/v1", model: "deepseek-flash", rerank: true },
     library: {
       rootId: "",
       rootName: "",
@@ -3249,6 +3252,14 @@
     } else config.tmdb.apiBase = "";
     // 校准候选不过滤 S00 特典：默认关（过滤），只认严格 true
     config.tmdb.showAllSpecials = config.tmdb.showAllSpecials === true;
+    // AI 辅助识别：接口地址与 TMDB 替代源同款归一化（没写协议头按 https、去尾部斜杠）；
+    // 默认关，只认严格 true；候选重排默认开（未显式关掉即跟随启用）
+    const aiApiBaseRaw = String(config.ai?.apiBase ?? "").replace(/\s+/g, "");
+    config.ai.apiBase = aiApiBaseRaw ? (/^https?:\/\//i.test(aiApiBaseRaw) ? aiApiBaseRaw : `https://${aiApiBaseRaw}`).replace(/\/+$/, "") : "";
+    config.ai.credential = String(config.ai?.credential ?? "").trim();
+    config.ai.model = String(config.ai?.model ?? "").trim();
+    config.ai.enabled = config.ai.enabled === true;
+    config.ai.rerank = config.ai.rerank !== false;
     applySpecialKeywordMappings(config.library.recognition.fixedMappings);
     config.schemaVersion = 16;
     delete config.metadata;
@@ -3286,7 +3297,10 @@
     }
     export({ includeSecrets = false } = {}) {
       const data = this.get();
-      if (!includeSecrets) data.tmdb.credential = "";
+      if (!includeSecrets) {
+        data.tmdb.credential = "";
+        if (data.ai) data.ai.credential = "";
+      }
       return JSON.stringify(data, null, 2);
     }
   };
@@ -5280,7 +5294,8 @@
 
   // src/tmdb.js
   var API_BASE = "https://api.themoviedb.org/3";
-  function gmRequest(url, headers = {}) {
+  function gmRequest(url, headers = {}, options = {}) {
+    const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 3e4;
     return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest !== "function") {
         fetch(url, { headers }).then(async (response) => {
@@ -5294,7 +5309,7 @@
         method: "GET",
         url,
         headers: { accept: "application/json", ...headers },
-        timeout: 3e4,
+        timeout: timeoutMs,
         onload: (response) => {
           let data = {};
           try {
@@ -5522,7 +5537,13 @@
     }
   };
   var bangumiClient = new BangumiClient();
-  var CURE_TMDB_TV_JSON_URL = "https://raw.githubusercontent.com/wikrin/CureTMDb/main/tv.json";
+  // CureTMDb 社区分季表：GitHub 原始地址（raw.githubusercontent）在大陆常被墙或很慢，
+  // 优先走 jsDelivr CDN（同一文件、实测更快更稳），失败再回退原始地址。
+  var CURE_TMDB_TV_JSON_URLS = [
+    "https://cdn.jsdelivr.net/gh/wikrin/CureTMDb@main/tv.json",
+    "https://raw.githubusercontent.com/wikrin/CureTMDb/main/tv.json"
+  ];
+  var CURE_TMDB_TV_FETCH_TIMEOUT = 12e3;
   var CURE_TMDB_TV_CACHE_KEY = "Cloud123.Helper.CureTmdbTvJson";
   var CURE_TMDB_TV_CACHE_TTL = 24 * 60 * 60 * 1000;
   var BANGUMI_STRUCTURE_CACHE_PREFIX = "Cloud123.Helper.BangumiStructure:";
@@ -5548,15 +5569,23 @@
       if (cached && Number(cached.time) && Date.now() - Number(cached.time) <= CURE_TMDB_TV_CACHE_TTL && cached.value) return cached.value;
     } catch {
     }
-    const raw = await gmRequest(CURE_TMDB_TV_JSON_URL).catch(() => null);
-    if (!raw || typeof raw !== "object") throw new Error("CureTMDb \u793E\u533A\u5206\u5B63\u8868\u8BFB\u53D6\u5931\u8D25");
-    const parsed = parseCureTmdbTvJson(raw);
-    if (!Object.keys(parsed).length) throw new Error("CureTMDb \u793E\u533A\u5206\u5B63\u8868\u683C\u5F0F\u4E3A\u7A7A");
-    try {
-      checkpointStorageSet(CURE_TMDB_TV_CACHE_KEY, { time: Date.now(), value: parsed });
-    } catch {
+    let lastError = null;
+    for (const url of CURE_TMDB_TV_JSON_URLS) {
+      try {
+        const raw = await gmRequest(url, {}, { timeoutMs: CURE_TMDB_TV_FETCH_TIMEOUT });
+        if (!raw || typeof raw !== "object") throw new Error("CureTMDb \u793E\u533A\u5206\u5B63\u8868\u8BFB\u53D6\u5931\u8D25");
+        const parsed = parseCureTmdbTvJson(raw);
+        if (!Object.keys(parsed).length) throw new Error("CureTMDb \u793E\u533A\u5206\u5B63\u8868\u683C\u5F0F\u4E3A\u7A7A");
+        try {
+          checkpointStorageSet(CURE_TMDB_TV_CACHE_KEY, { time: Date.now(), value: parsed });
+        } catch {
+        }
+        return parsed;
+      } catch (error) {
+        lastError = error;
+      }
     }
-    return parsed;
+    throw lastError || new Error("CureTMDb \u793E\u533A\u5206\u5B63\u8868\u8BFB\u53D6\u5931\u8D25");
   }
   async function loadCureTmdbTvStructure(tmdbId) {
     const map = await loadCureTmdbTvMap();
@@ -6950,6 +6979,15 @@
   // 历史版本条目不用回改（弹窗只按当前版本号取对应那一版）。机检在 changelog-notice.test.mjs。
   var CHANGELOG_SEEN_KEY = "Cloud123.Helper.SeenChangelog";
   var SCRIPT_CHANGELOG = [
+    {
+      version: "1.5.0",
+      notes: [
+        "整理识别认不出片名时，可以让 AI 帮忙判断，再回 TMDB 核对",
+        "整理识别在多条同名片里挑错时，也会请 AI 复核挑对的那条",
+        "整理策略的分季数据换了条更稳的线路，打开弹窗不再一直转圈",
+        "分季数据没收录这部作品时会说明原因，不再只显示 TMDB 一项"
+      ]
+    },
     {
       version: "1.4.11",
       notes: [
@@ -20464,6 +20502,297 @@ ${end.comment}` : end.comment;
     return { ...block, id: uniqueId(block.type || "block") };
   }
 
+  // src/ai.js — AI 辅助识别（OpenAI 兼容接口：DeepSeek / OpenAI / 通义千问 / GLM / Kimi / Ollama…）
+  // 只做脚本做不好的两件事：把脏文件名归一化成干净片名、从多条同名 TMDB 候选里挑对的那条。
+  // TMDB 条目（含 ID）一律仍由脚本自己去查、去校验，模型只给「片名 / 年份 / 类型」这类语义判断，
+  // 因此不存在让模型编造 TMDB ID 的空间。
+  var AI_DEFAULT_API_BASE = "https://api.deepseek.com/v1";
+  function aiApiBase(settings = {}) {
+    const custom = String(settings.apiBase || "").replace(/\s+/g, "");
+    return custom ? (/^https?:\/\//i.test(custom) ? custom : `https://${custom}`).replace(/\/+$/, "") : AI_DEFAULT_API_BASE;
+  }
+  // 统一按 OpenAI 兼容协议拼 /chat/completions：接口地址填到 /v1 为止即可
+  // （DeepSeek 填 https://api.deepseek.com/v1，OpenAI 填 https://api.openai.com/v1，
+  // 本地 Ollama 填 http://localhost:11434/v1）；已带 /chat/completions 的地址原样使用。
+  function aiChatEndpoint(settings = {}) {
+    const base = aiApiBase(settings);
+    return /\/chat\/completions$/i.test(base) ? base : `${base}/chat/completions`;
+  }
+  // POST JSON 走 GM_xmlhttpRequest（脚本已 @connect *）：浏览器直接 fetch 官方 AI 域名会被 CORS 拦，
+  // 油猴请求则不受限。无 GM API 时退回 fetch（供测试注入）。
+  function aiHttpRequest(url, { method = "POST", headers = {}, body, timeoutMs = 3e4, signal } = {}) {
+    return new Promise((resolve, reject) => {
+      const payload = body === void 0 ? void 0 : JSON.stringify(body);
+      const dispatch = typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : null;
+      if (!dispatch) {
+        fetch(url, { method, headers, body: payload, signal }).then(async (response) => {
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data?.error?.message || data?.message || `AI HTTP ${response.status}`);
+          resolve(data);
+        }).catch(reject);
+        return;
+      }
+      let settled = false;
+      let request;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener?.("abort", abort);
+        callback(value);
+      };
+      const abort = () => {
+        request?.abort?.();
+        finish(reject, new Error("AI 请求已取消"));
+      };
+      if (signal?.aborted) {
+        reject(new Error("AI 请求已取消"));
+        return;
+      }
+      signal?.addEventListener?.("abort", abort);
+      request = dispatch({
+        method,
+        url,
+        headers: { ...headers },
+        data: payload,
+        timeout: timeoutMs,
+        onload: (response) => {
+          let data = {};
+          try {
+            data = JSON.parse(response.responseText || "{}");
+          } catch {
+          }
+          if (response.status < 200 || response.status >= 300) finish(reject, new Error(data?.error?.message || data?.message || `AI HTTP ${response.status}`));
+          else finish(resolve, data);
+        },
+        onerror: () => finish(reject, new Error("AI 网络请求失败")),
+        ontimeout: () => finish(reject, new Error("AI 请求超时"))
+      });
+    });
+  }
+  var AI_FAILURE_TRIP = 3;
+  // AI 请求单独限流：同时在飞的模型请求不超过 2（整理预览的组并发是 3，AI 再压一档避免 429）。
+  var AI_MAX_CONCURRENCY = 2;
+  // 批量识别的打包大小：一次请求里塞多少个目录（越小越灵，越大越省调用）。
+  var AI_RECOGNITION_BATCH = 8;
+  function isTransientAiError(error) {
+    return /超时|网络请求失败|HTTP 5\d\d|HTTP 429|Failed to fetch|NetworkError|Load failed/i.test(String(error?.message || ""));
+  }
+  var AiClient = class {
+    constructor(settingsProvider) {
+      this.settingsProvider = settingsProvider;
+      this.cache = /* @__PURE__ */ new Map();
+      this.failures = 0;
+      this.trippedAt = "";
+      this.active = 0;
+      this.waiters = [];
+    }
+    settings() {
+      return this.settingsProvider?.() || {};
+    }
+    // 接口/模型/密钥指纹：熔断后用户改了配置就自动恢复，不用刷新页面。
+    settingsKey() {
+      const settings = this.settings();
+      return `${aiChatEndpoint(settings)}::${String(settings.model || "")}::${String(settings.credential || "").slice(0, 8)}`;
+    }
+    available() {
+      const settings = this.settings();
+      if (!(settings.enabled === true && String(settings.credential || "").trim() && String(settings.model || "").trim())) return false;
+      if (this.trippedAt && this.trippedAt !== this.settingsKey()) this.trippedAt = "";
+      return !this.trippedAt;
+    }
+    // 名额信号量：满了就排队；唤醒时把名额直接转交给等待者（不先减计数，避免「唤醒」与「新增」抢名额导致超限）。
+    acquire() {
+      if (this.active < AI_MAX_CONCURRENCY) {
+        this.active += 1;
+        return Promise.resolve();
+      }
+      return new Promise((resolve) => this.waiters.push(resolve));
+    }
+    release() {
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.active -= 1;
+    }
+    // 相同请求 24 小时内复用（整理预览会反复重建，缓存省掉重复调用与费用）
+    async complete(messages, options = {}) {
+      if (!this.available()) throw new Error(this.trippedAt ? "AI 已熔断（连续失败），请检查接口与密钥" : "未配置 AI 辅助识别");
+      const key = `${aiChatEndpoint(this.settings())}::${String(this.settings().model || "")}::${JSON.stringify(messages)}`;
+      const cached = this.cache.get(key);
+      if (cached && Date.now() - cached.time < 864e5) return cached.value;
+      const validate = typeof options.validate === "function" ? options.validate : () => true;
+      await this.acquire();
+      try {
+        const settings = this.settings();
+        let lastError;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            const data = await aiHttpRequest(aiChatEndpoint(settings), {
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${String(settings.credential || "").trim()}` },
+              body: { model: settings.model, messages, temperature: 0, stream: false },
+              timeoutMs: Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 3e4,
+              signal: options.signal
+            });
+            const value = String(data?.choices?.[0]?.message?.content ?? "").trim();
+            if (!value) throw new Error("AI 未返回内容");
+            this.failures = 0;
+            this.trippedAt = "";
+            // 只缓存「解析得出来」的结果：模型偶尔回一段废话，别让坏结果占着缓存一整天。
+            if (validate(value)) {
+              this.cache.set(key, { time: Date.now(), value });
+              if (this.cache.size > 64) this.cache.delete(this.cache.keys().next().value);
+            }
+            return value;
+          } catch (error) {
+            lastError = error;
+            if (options.signal?.aborted) throw error;
+            // 瞬时故障（超时/网络/限流/5xx）先重试一次再计入熔断。
+            if (attempt === 0 && isTransientAiError(error)) {
+              await sleep(600 + Math.floor(Math.random() * 400));
+              continue;
+            }
+            break;
+          }
+        }
+        // 连续失败达上限即熔断：密钥填错时不至于对每个未识别组反复打无效请求、刷一屏警告。
+        this.failures += 1;
+        if (this.failures >= AI_FAILURE_TRIP) this.trippedAt = this.settingsKey();
+        throw lastError;
+      } finally {
+        this.release();
+      }
+    }
+  };
+  // 模型常在 JSON 后面补一句解释（"…because …"），整段 parse 会崩：先抠代码块，再从第一个 { 起
+  // 按括号深度扫到配对处截断，逐段尝试解析，取第一个能成功且是对象的结果。
+  function parseAiJsonObject(text) {
+    const source = String(text || "").trim();
+    if (!source) return null;
+    const fenced = source.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const segments = [fenced ? fenced[1] : "", source].filter(Boolean);
+    for (const segment of segments) {
+      const start = segment.indexOf("{");
+      if (start < 0) continue;
+      let depth = 0;
+      let inString = false;
+      let escape = false;
+      for (let index = start; index < segment.length; index += 1) {
+        const character = segment[index];
+        if (inString) {
+          if (escape) escape = false;
+          else if (character === "\\") escape = true;
+          else if (character === "\"") inString = false;
+          continue;
+        }
+        if (character === "\"") inString = true;
+        else if (character === "{") depth += 1;
+        else if (character === "}") {
+          depth -= 1;
+          if (depth === 0) {
+            try {
+              const parsed = JSON.parse(segment.slice(start, index + 1));
+              if (parsed && typeof parsed === "object") return parsed;
+            } catch {
+            }
+            break;
+          }
+        }
+      }
+    }
+    return null;
+  }
+  // AI 兜底识别的提示词：给它目录名与前若干文件名，要求把片名还原成 TMDB 能搜到的正式名称。
+  function buildAiRecognitionMessages(folderName, fileNames) {
+    const system = [
+      "你是影视元数据识别助手。用户给你一个资源目录名和其中的文件名，你要判断这是哪部影视作品。",
+      "只输出一个 JSON 对象，不要输出任何解释文字。字段如下：",
+      "title（作品正式名称，中文优先；确定不了就填空字符串）、",
+      "original_title（外文原名，可空）、year（首播/上映年份，4 位数字符串，可空）、",
+      "media_type（movie 或 tv，可空）、season（季号数字，可空）、episode（集号数字，可空）、",
+      "confidence（你对判断的把握，0 到 1 的数字）。",
+      "只做片名识别：拿不准时宁可留空，也不要编造。季号、集号按文件名里的 SxxEyy / 第 N 期 等标记判断。"
+    ].join("");
+    const lines = [`目录名：${String(folderName || "").trim() || "（无）"}`, "目录内文件："];
+    for (const name of (fileNames || []).slice(0, 20)) lines.push(`- ${String(name || "").trim()}`);
+    if (!fileNames || !fileNames.length) lines.push("（无文件名，仅凭目录名判断）");
+    return [{ role: "system", content: system }, { role: "user", content: lines.join("\n") }];
+  }
+  function normalizeAiRecognitionFields(source) {
+    const text2 = (value) => toSimplified(String(value ?? "").trim());
+    const mediaTypeRaw = String(source?.media_type ?? source?.mediaType ?? "").trim().toLowerCase();
+    const mediaType = ["movie", "tv"].includes(mediaTypeRaw) ? mediaTypeRaw : "";
+    const year = (String(source?.year ?? "").trim().match(/^(?:19|20)\d{2}$/) || [""])[0];
+    const season = Number.isFinite(Number(source?.season)) && Number(source.season) >= 0 ? Number(source.season) : 0;
+    const episode = Number.isFinite(Number(source?.episode)) && Number(source.episode) > 0 ? Number(source.episode) : 0;
+    const confidence = Number(source?.confidence);
+    return {
+      title: text2(source?.title),
+      originalTitle: text2(source?.original_title ?? source?.originalTitle),
+      mediaType,
+      year,
+      season,
+      episode,
+      confidence: Number.isFinite(confidence) ? confidence : 0
+    };
+  }
+  function parseAiRecognitionResult(text) {
+    const parsed = parseAiJsonObject(text);
+    return parsed ? normalizeAiRecognitionFields(parsed) : null;
+  }
+  // 批量识别：一次请求判断多个目录，省调用与费用。要求模型按 key 回填，避免顺序错位。
+  function buildAiRecognitionBatchMessages(items) {
+    const system = [
+      "你是影视元数据识别助手。用户一次给你多个资源目录（含目录名与文件名），逐个判断这是哪部影视作品。",
+      "只输出一个 JSON 对象，不要输出任何解释文字：{\"results\":[{\"key\":\"输入的 key\",\"title\":...,\"original_title\":...,\"year\":...,\"media_type\":...,\"season\":...,\"episode\":...,\"confidence\":...}]}。",
+      "key 必须与输入项一一对应；title 填作品正式名称（中文优先，确定不了就填空字符串）、year 为 4 位年份字符串、media_type 只能是 movie 或 tv。",
+      "拿不准的项宁可把 title 留空，也不要编造。"
+    ].join("");
+    const user = JSON.stringify((items || []).map((item) => ({ key: String(item.key || ""), folder: String(item.folder || ""), files: (item.files || []).slice(0, 12) })), null, 0);
+    return [{ role: "system", content: system }, { role: "user", content: user }];
+  }
+  function parseAiRecognitionBatchResult(text, keys) {
+    const parsed = parseAiJsonObject(text);
+    if (!parsed) return null;
+    const list = Array.isArray(parsed.results) ? parsed.results : Object.values(parsed).find((value) => Array.isArray(value));
+    if (!Array.isArray(list)) return null;
+    const wanted = new Set((keys || []).map(String));
+    const output = /* @__PURE__ */ new Map();
+    for (const item of list) {
+      if (!item || typeof item !== "object") continue;
+      const key = String(item.key ?? item.id ?? "");
+      if (!wanted.has(key) || output.has(key)) continue;
+      output.set(key, normalizeAiRecognitionFields(item));
+    }
+    return output.size ? output : null;
+  }
+  // 候选重排的提示词：交代 token 里那些「看着像错、其实对」的情形（季目录、合集包），
+  // 免得模型把 URL 名称与季播年不符这类正常情况误判为不匹配。
+  function buildAiRerankMessages(context, candidates) {
+    const system = [
+      "你是影视条目校对助手。用户在整理影视资源，脚本已经用目录名在 TMDB 搜出若干候选，",
+      "再请你结合目录名与候选信息，判断哪一条才是这个资源目录对应的作品。",
+      "判断要点：",
+      "1. 文件名里的年份常是某一季的播出年，可能与剧集首播年不同，不因此排除；",
+      "2. 带「全季 / 全集 / 合集 / 合辑」字样的通常是整部剧，而不是它的衍生篇或某一部；",
+      "3. 同一系列里热度更高的续作可能排在候选更前面，要按目录名里的年份、季号、副标题等线索挑准。",
+      "只输出一个 JSON 对象，不要输出解释文字：{\"index\": 选中的候选序号, \"confidence\": 0 到 1 的数字}。",
+      "若没有任何候选匹配，输出 {\"index\": -1}。"
+    ].join("");
+    const user = JSON.stringify({
+      folder: String(context?.folder || ""),
+      files: (context?.files || []).slice(0, 10),
+      脚本识别: { title: String(context?.title || ""), year: String(context?.year || ""), media_type: String(context?.media_type || "") },
+      candidates
+    }, null, 0);
+    return [{ role: "system", content: system }, { role: "user", content: user }];
+  }
+  function parseAiRerankIndex(text, count) {
+    const parsed = parseAiJsonObject(text);
+    if (!parsed) return null;
+    const index = Number(parsed.index);
+    if (!Number.isInteger(index) || index < 0 || index >= count) return null;
+    return index;
+  }
+
   // src/core/organize.js
   var MAX_ORGANIZE_DEPTH = 8;
   var GENERIC_WEAK_FOLDERS = /^(?:Transfer|Downloads?|下载|待整理|未分类|Movies?|电影|影片|Shows?|Series|剧集|电视剧|TV|综艺|动漫|动画|Documentaries|纪录片|Media|媒体|媒体库|Videos?|Resources?|资源|Folder|Dir|Directory|新建文件夹|文件夹)$/i;
@@ -21118,6 +21447,53 @@ ${end.comment}` : end.comment;
     for (const item of detailed.filter(Boolean)) byId.set(`${item.mediaType}:${item.id}`, item);
     return [...byId.values()];
   }
+  // AI 辅助识别是否可用：要开启且客户端就绪，同时 TMDB 有凭据——否则 AI 拿到了片名也查不到
+  // 条目，等于白调一次模型还刷一条「AI 识别后 TMDB 查询失败」的误导性警告。
+  function aiAssistReady(tmdb, options = {}) {
+    const ai = options.ai;
+    if (!ai || typeof ai.complete !== "function" || typeof ai.available !== "function" || options.aiRecognition === false) return false;
+    if (typeof tmdb?.settings === "function" && !String(tmdb.settings()?.credential || "").trim()) return false;
+    return Boolean(ai.available());
+  }
+  // 挑出「本地认不出片名」的组（与 resolveMedia 的判定保持一致），打包交给 AI 批量识别。
+  // 结果写回 options.aiRecognitionByGroup：命中即直接取用；AI 也没判断出来时记 {result:null}，
+  // 让 resolveMedia 静默退回本地，不再对同一个组重复调用。
+  function aiRecognitionCandidates(groups, config, options) {
+    const pending = [];
+    for (const group of groups || []) {
+      if (options.mediaByGroup?.[group.id]) continue;
+      const names = (group.files || []).map((file) => file?.name);
+      let fields = inferFields(group.title, names.filter(isVideoFile), config.library);
+      if (group.targetSeason && !group.unidentified && fields.mediaType === "unknown") fields.mediaType = "tv";
+      fields = { ...fields, ...(options.metadataByGroup?.[group.id] || {}), ...(options.overrides?.[group.id] || options.overrideFields || {}) };
+      if (!(group.unidentified || isWeakLooseTitle(fields.title))) continue;
+      if (fields.tmdbId) continue;
+      pending.push({ group, key: String(group.id), folder: String(group.sourceFolderName || group.title || ""), files: aiGroupFileNameList(group) });
+    }
+    return pending;
+  }
+  async function prefetchAiRecognition(tmdb, groups, config, options, warnings) {
+    const pending = aiRecognitionCandidates(groups, config, options);
+    if (!pending.length) return;
+    const byGroup = options.aiRecognitionByGroup || (options.aiRecognitionByGroup = {});
+    const chunks = [];
+    for (let index = 0; index < pending.length; index += AI_RECOGNITION_BATCH) chunks.push(pending.slice(index, index + AI_RECOGNITION_BATCH));
+    await mapLimit(chunks, AI_MAX_CONCURRENCY, async (chunk) => {
+      const keys = chunk.map((item) => item.key);
+      try {
+        const text2 = await options.ai.complete(buildAiRecognitionBatchMessages(chunk.map((item) => ({ key: item.key, folder: item.folder, files: item.files }))), {
+          signal: options.signal,
+          validate: (value) => Boolean(parseAiRecognitionBatchResult(value, keys))
+        });
+        const parsed = parseAiRecognitionBatchResult(text2, keys) || /* @__PURE__ */ new Map();
+        for (const item of chunk) byGroup[item.key] = { done: true, result: parsed.get(item.key) || null };
+      } catch (error) {
+        // 整批失败：这批组退回本地识别（熔断后不会再发起后续批次），提示只给一次、不按组刷屏。
+        warnings.push(`AI 批量识别失败（${chunk.length} 个目录）：${error.message}`);
+        for (const item of chunk) byGroup[item.key] = { done: true, result: null };
+      }
+    }, { signal: options.signal });
+  }
   async function resolveMedia(tmdb, group, fields, options = {}) {
     if (options.media) {
       if (options.mediaResolved) return normalizeTmdbMedia(options.media);
@@ -21128,7 +21504,21 @@ ${end.comment}` : end.comment;
         return normalizeTmdbMedia(options.media);
       }
     }
-    if (group.unidentified || isWeakLooseTitle(fields.title)) return null;
+    // AI 辅助识别只在「配置开启 + 客户端可用」时生效；关闭时与旧行为完全一致。
+    const ai = options.ai;
+    const aiEnabled = aiAssistReady(tmdb, options);
+    if (group.unidentified || isWeakLooseTitle(fields.title)) {
+      // 文件名里直接带了 TMDB ID 时按 ID 查最准，别绕道 AI（AI 拿到片名也要回来查 TMDB）。
+      if (fields.tmdbId) {
+        const byId = await resolveMediaById(tmdb, fields);
+        if (byId) {
+          options.warnings?.push(`${group.title}：脚本标题太弱，已按文件名里的 TMDB ID 识别为「${byId.title}」${byId.year ? `（${byId.year}）` : ""}，请核对`);
+          return byId;
+        }
+      }
+      if (!aiEnabled) return null;
+      return resolveMediaViaAi(tmdb, ai, group, fields, options);
+    }
     try {
       if (fields.tmdbId) {
         const explicitType = options.mediaType || (fields.mediaType === "unknown" ? "" : fields.mediaType);
@@ -21155,7 +21545,16 @@ ${end.comment}` : end.comment;
         candidates = [...candidates, ...await searchTmdbCandidates(tmdb, fields, { ...sourceOptions, typeOverride: "" })];
         candidate = normalizeTmdbMedia(chooseTmdbCandidate(candidates, fields));
       }
-      if (!candidate) return null;
+      if (!candidate) {
+        // 搜不到：把脏文件名交给 AI 归一化成干净片名后重搜一遍（AI 只给片名，ID 仍由脚本查）。
+        return aiEnabled ? resolveMediaViaAi(tmdb, ai, group, fields, options) : null;
+      }
+      // 搜到了但脚本可能选错（同系列热度更高的续作排在前面）：前二接近或最高分不够硬时，
+      // 让 AI 结合目录名复核候选；明确命中的资源不触发，正常识别结果不受影响。
+      if (aiEnabled && options.aiRerank !== false) {
+        const picked = await aiRerankCandidate(ai, group, fields, candidates, candidate, options);
+        if (picked) candidate = picked;
+      }
       // 注意不能用 englishTitles 非空判断"详情已补全"：英文原名的影片搜索结果天然带
       // 原名这个英文标题，会短路跳过 details（alternative_titles/translations）补全，
       // 导致英文别名只剩原名一个。TMDB 请求有 24h 缓存，重复 details 成本可忽略。
@@ -21166,10 +21565,127 @@ ${end.comment}` : end.comment;
         return candidate;
       }
     } catch (error) {
+      // 这里是 TMDB 侧的失败（网络/限流/凭据）：AI 兜底同样要靠 TMDB 查条目，再调一次没有意义，
+      // 只会多一次模型开销和一条重复警告，所以直接沿用本地识别。
       if (/配置 TMDB/.test(error.message)) return null;
       options.warnings?.push(`${group.title}\uFF1ATMDB \u67E5\u8BE2\u5931\u8D25\uFF0C\u5DF2\u4F7F\u7528\u672C\u5730\u8BC6\u522B\uFF08${error.message}\uFF09`);
       return null;
     }
+  }
+  function aiGroupFileNameList(group) {
+    return (group?.files || []).map((file) => String(file?.name || "")).filter((name) => name && isVideoFile(name));
+  }
+  // AI 兜底识别：脚本没认出来（无标题 / 搜不到）时，把目录名与文件名交给 AI 归一化成干净片名，
+  // 再用脚本自己的搜索 + 打分去 TMDB 查真条目；AI 给的片名搜不到就放弃，绝不采信模型编的 ID。
+  // 按文件名里显式带的 TMDB ID 查条目：弱标题/未识别组用，顺序上优先于 AI。类型不确定时
+  // 电影、剧集各试一次，取先命中的那条（显式 ID 就是事实，不再按弱标题打分筛）。
+  async function resolveMediaById(tmdb, fields) {
+    const types = ["movie", "tv"].includes(fields.mediaType) ? [fields.mediaType] : ["movie", "tv"];
+    for (const type of types) {
+      try {
+        const candidate = normalizeTmdbMedia(await tmdb.details(type, fields.tmdbId));
+        if (candidate) return candidate;
+      } catch {
+      }
+    }
+    return null;
+  }
+  async function resolveMediaViaAi(tmdb, ai, group, fields, options = {}) {
+    const folderName = String(group?.sourceFolderName || group?.title || "").trim();
+    let result2 = null;
+    // 批量预取命中过就直接用（含「AI 也没判断出来」的结果：不再重复调用，失败提示在预取阶段已给过）。
+    const prefetched = options.aiRecognitionByGroup?.[group.id];
+    if (prefetched) {
+      result2 = prefetched.result;
+    } else {
+      try {
+        result2 = parseAiRecognitionResult(await ai.complete(buildAiRecognitionMessages(folderName, aiGroupFileNameList(group)), {
+          signal: options.signal,
+          validate: (value) => Boolean(parseAiRecognitionResult(value))
+        }));
+      } catch (error) {
+        options.warnings?.push(`${group?.title || folderName}：AI 识别失败（${error.message}）`);
+        return null;
+      }
+    }
+    if (!result2?.title) return null;
+    const aiFields = {
+      ...fields,
+      title: result2.title,
+      namingTitle: result2.title,
+      year: result2.year || fields.year || "",
+      mediaType: result2.mediaType || (fields.mediaType === "unknown" ? "" : fields.mediaType) || "",
+      season: String(result2.season || fields.season || 1),
+      tmdbId: ""
+    };
+    try {
+      const sourceOptions = { ...options, sourceTitle: group.title };
+      let candidates = await searchTmdbCandidates(tmdb, aiFields, sourceOptions);
+      let candidate = normalizeTmdbMedia(chooseTmdbCandidate(candidates, aiFields));
+      if (!candidate && ["movie", "tv"].includes(aiFields.mediaType)) {
+        candidates = [...candidates, ...await searchTmdbCandidates(tmdb, aiFields, { ...sourceOptions, typeOverride: "" })];
+        candidate = normalizeTmdbMedia(chooseTmdbCandidate(candidates, aiFields));
+      }
+      if (!candidate) {
+        options.warnings?.push(`${group.title}：AI 判断为「${result2.title}」，但 TMDB 未找到匹配条目，请在预览中手动确认`);
+        return null;
+      }
+      let media = candidate;
+      if (!(candidate.seasons || candidate.aliases || candidate.chineseTitles?.length || typeof tmdb.details !== "function")) {
+        try {
+          media = normalizeTmdbMedia(await tmdb.details(candidate.mediaType, candidate.id));
+        } catch {
+          media = candidate;
+        }
+      }
+      options.warnings?.push(`${group.title}：脚本未识别，已用 AI 判断为「${media?.title || result2.title}」${media?.year ? `（${media.year}）` : ""}，请核对`);
+      return media;
+    } catch (error) {
+      options.warnings?.push(`${group.title}：AI 识别后 TMDB 查询失败（${error.message}）`);
+      return null;
+    }
+  }
+  // 判断脚本的选择是否「有歧义、值得让 AI 复核」：最高分不够硬或前二过于接近时才算歧义。
+  // 明确命中（精确/别名命中动辄 200+ 分）不会触发，正常资源不受影响。
+  function aiRerankShortlist(candidates, fields, limit = 6) {
+    const scored = [...candidates || []].map((candidate, index) => ({ candidate, index, score: scoreTmdbCandidate(candidate, fields) }))
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+    const shortlist = scored.slice(0, limit).map((item) => item.candidate);
+    const best = scored[0];
+    const second = scored[1];
+    const uncertain = !best || best.score < 140 || Boolean(second && best.score - second.score < 40);
+    return { shortlist, uncertain };
+  }
+  async function aiRerankCandidate(ai, group, fields, candidates, chosen, options = {}) {
+    const decision = aiRerankShortlist(candidates, fields);
+    if (!decision.uncertain || decision.shortlist.length < 2) return null;
+    const context = {
+      folder: String(group?.sourceFolderName || group?.title || ""),
+      files: aiGroupFileNameList(group),
+      title: fields.title,
+      year: fields.year,
+      media_type: fields.mediaType === "unknown" ? "" : fields.mediaType
+    };
+    const listing = decision.shortlist.map((candidate, index) => {
+      const media = normalizeTmdbMedia(candidate) || {};
+      return { index, title: media.title || "", original_title: media.originalTitle || "", year: media.year || "", media_type: media.mediaType || "" };
+    });
+    let index = null;
+    try {
+      index = parseAiRerankIndex(await ai.complete(buildAiRerankMessages(context, listing), {
+        signal: options.signal,
+        validate: (value) => parseAiRerankIndex(value, listing.length) !== null
+      }), listing.length);
+    } catch {
+      return null;
+    }
+    if (index === null) return null;
+    const picked = normalizeTmdbMedia(decision.shortlist[index]);
+    if (!picked) return null;
+    const current = normalizeTmdbMedia(chosen);
+    if (current && picked.mediaType === current.mediaType && picked.id === current.id) return null;
+    options.warnings?.push(`${group.title}：脚本识别的候选不确定，已用 AI 复核改选「${picked.title}」${picked.year ? `（${picked.year}）` : ""}，请核对`);
+    return picked;
   }
   function availableSeasons(media, requested, options = {}) {
     const wanted = [...new Set(requested.map(Number).filter((season) => Number.isInteger(season) && season >= 0))];
@@ -21322,7 +21838,9 @@ ${end.comment}` : end.comment;
     let fields = inferFields(group.title, names.filter(isVideoFile), config.library);
     if (Number.isInteger(Number(group.targetSeason)) && Number(group.targetSeason) > 0) fields.season = String(Number(group.targetSeason));
     if (group.targetSeason && !group.unidentified && fields.mediaType === "unknown") fields.mediaType = "tv";
-    if (group.unidentified && fields.title === "\u672A\u8BC6\u522B\u5A92\u4F53") warnings.push(`${group.sourceFolderName || group.title}\uFF1A\u672A\u8BC6\u522B\u51FA\u5A92\u4F53\u6807\u9898\uFF0C\u8BF7\u5728\u9884\u89C8\u4E2D\u624B\u5DE5\u4FEE\u6B63`);
+    // AI 辅助识别开启时，「未识别出媒体标题」的提示交给 AI 兜底去处理；只有没开 AI 时才提示手工修正。
+    const aiReady = aiAssistReady(tmdb, options);
+    if (!aiReady && group.unidentified && fields.title === "\u672A\u8BC6\u522B\u5A92\u4F53") warnings.push(`${group.sourceFolderName || group.title}\uFF1A\u672A\u8BC6\u522B\u51FA\u5A92\u4F53\u6807\u9898\uFF0C\u8BF7\u5728\u9884\u89C8\u4E2D\u624B\u5DE5\u4FEE\u6B63`);
     const metadataFields = options.metadataByGroup?.[group.id] || {};
     const groupOverride = options.overrides?.[group.id] || options.overrideFields || {};
     fields = { ...fields, ...metadataFields, ...groupOverride };
@@ -21647,6 +22165,11 @@ ${end.comment}` : end.comment;
     const groups = await collectOrganizeGroups(api, items, config, { ...options, tmdb, warnings });
     const excludedGroups = options.excludedGroupIds || /* @__PURE__ */ new Set();
     const activeGroups = groups.filter((group) => !(excludedGroups.has?.(group.id) || excludedGroups.includes?.(group.id)));
+    // AI 兜底识别先打包预取：识别阶段开始前把「本地认不出片名」的组批量问一次 AI（每批一次请求，
+    // 而不是每组一次），结果写回 options 供 resolveMedia 直接取用；未识别组多时省调用、省费用、也更快。
+    if (aiAssistReady(tmdb, options) && options.aiBatchRecognition !== false) {
+      await prefetchAiRecognition(tmdb, activeGroups, config, options, warnings);
+    }
     let recognized = 0;
     const builtGroups = await mapLimit(
       activeGroups,
@@ -24403,8 +24926,8 @@ ${end.comment}` : end.comment;
     if (strategyUsesStructure(dialog.pick)) {
       const media = group.media;
       if (!media?.id || (media.mediaType || group.fields.mediaType) !== "tv") structureList = notice("\u8BF7\u5148\u901A\u8FC7\u300C\u67E5\u8BE2\u56DE\u5199\u300D\u9009\u62E9\u4E00\u4E2A TMDB \u5267\u96C6\uFF0C\u518D\u9009\u62E9\u5206\u5B63\u6570\u636E\u3002", "warning");
-      else if (dialog.structuresLoading) structureList = `<div class="strategy-groups-loading">${icon("loading", 18, "spin")} \u6B63\u5728\u8BFB\u53D6\u771F\u5B9E\u5206\u5B63\u6570\u636E\u2026</div>`;
-      else if (dialog.structuresList?.length) structureList = `<div class="strategy-groups"><p class="strategy-groups-title">\u9009\u62E9\u5206\u5B63\u6570\u636E\uFF08\u62C6\u5206\u6309\u8FD9\u4EFD\u5B63\u96C6\u8868\u5BF9\u53F7\u5165\u5EA7\uFF09</p>${dialog.structuresInfo ? `<p class="strategy-groups-title">${escapeHtml(dialog.structuresInfo)}</p>` : ""}${dialog.structuresError ? `${notice(dialog.structuresError, "error")}<button class="button compact" data-action="organize-strategy-reload" data-group="${escapeHtml(group.id)}">${icon("refresh", 14)}\u91CD\u8BD5</button>` : ""}${dialog.structuresList.map((item) => `<button type="button" class="strategy-card sub ${dialog.structureSource === item.source ? "picked" : ""}" data-action="organize-strategy-structure-pick" data-source="${escapeHtml(item.source)}"><span class="strategy-copy"><strong>${escapeHtml(item.sourceLabel || item.source)}</strong><small>${escapeHtml(structureSeasonChipsText(item))}</small>${item.name ? `<small class="strategy-desc">${escapeHtml([item.name, item.detail].filter(Boolean).join(" \xB7 "))}</small>` : ""}${structureIsSingleSeason(item) ? `<small class="strategy-desc">${dialog.pick === "merge" ? "\u5355\u671F\u7ED3\u6784\uFF1A\u96C6\u53F7\u5373\u5168\u4F5C\u7D2F\u8BA1\u96C6\u6570\uFF0C\u5408\u5E76\u540E\u6309\u539F\u96C6\u53F7\u7F16\u5165\u5355\u5B63" : "\u5355\u5B63\u7ED3\u6784\uFF0C\u65E0\u9700\u62C6\u5206\uFF1B\u591A\u5B63\u5408\u5E76\u578B\u4F5C\u54C1\u8BF7\u7528\u5408\u5E76\u7B56\u7565"}</small>` : ""}${item.incomplete ? `<small class="strategy-desc">\u6700\u65B0\u4E00\u671F\u96C6\u6570\u672A\u77E5\uFF0C\u53EF\u80FD\u8FDE\u8F7D\u4E2D</small>` : ""}</span><span class="strategy-check">${icon("check", 15)}</span></button>`).join("")}</div>`;
+      else if (dialog.structuresLoading && !dialog.structuresList?.length) structureList = `<div class="strategy-groups-loading">${icon("loading", 18, "spin")} \u6B63\u5728\u8BFB\u53D6\u771F\u5B9E\u5206\u5B63\u6570\u636E\u2026</div>`;
+      else if (dialog.structuresList?.length) structureList = `${dialog.structuresLoading ? `<div class="strategy-groups-loading">${icon("loading", 18, "spin")} \u6B63\u5728\u8BFB\u53D6 CureTMDb / Bangumi \u5206\u5B63\u6570\u636E\u2026</div>` : ""}<div class="strategy-groups"><p class="strategy-groups-title">\u9009\u62E9\u5206\u5B63\u6570\u636E\uFF08\u62C6\u5206\u6309\u8FD9\u4EFD\u5B63\u96C6\u8868\u5BF9\u53F7\u5165\u5EA7\uFF09</p>${dialog.structuresInfo ? `<p class="strategy-groups-title">${escapeHtml(dialog.structuresInfo)}</p>` : ""}${dialog.structuresError ? `${notice(dialog.structuresError, "error")}<button class="button compact" data-action="organize-strategy-reload" data-group="${escapeHtml(group.id)}">${icon("refresh", 14)}\u91CD\u8BD5</button>` : ""}${dialog.structuresList.map((item) => `<button type="button" class="strategy-card sub ${dialog.structureSource === item.source ? "picked" : ""}" data-action="organize-strategy-structure-pick" data-source="${escapeHtml(item.source)}"><span class="strategy-copy"><strong>${escapeHtml(item.sourceLabel || item.source)}</strong><small>${escapeHtml(structureSeasonChipsText(item))}</small>${item.name ? `<small class="strategy-desc">${escapeHtml([item.name, item.detail].filter(Boolean).join(" \xB7 "))}</small>` : ""}${structureIsSingleSeason(item) ? `<small class="strategy-desc">${dialog.pick === "merge" ? "\u5355\u671F\u7ED3\u6784\uFF1A\u96C6\u53F7\u5373\u5168\u4F5C\u7D2F\u8BA1\u96C6\u6570\uFF0C\u5408\u5E76\u540E\u6309\u539F\u96C6\u53F7\u7F16\u5165\u5355\u5B63" : "\u5355\u5B63\u7ED3\u6784\uFF0C\u65E0\u9700\u62C6\u5206\uFF1B\u591A\u5B63\u5408\u5E76\u578B\u4F5C\u54C1\u8BF7\u7528\u5408\u5E76\u7B56\u7565"}</small>` : ""}${item.incomplete ? `<small class="strategy-desc">\u6700\u65B0\u4E00\u671F\u96C6\u6570\u672A\u77E5\uFF0C\u53EF\u80FD\u8FDE\u8F7D\u4E2D</small>` : ""}</span><span class="strategy-check">${icon("check", 15)}</span></button>`).join("")}</div>`;
       else if (dialog.structuresError) structureList = `<div class="strategy-groups-status">${notice(dialog.structuresError, "error")}<button class="button compact" data-action="organize-strategy-reload" data-group="${escapeHtml(group.id)}">${icon("refresh", 14)}\u91CD\u8BD5</button></div>`;
     }
     return `<div class="dialog-layer" data-action="organize-strategy-cancel"><section class="mini-dialog strategy-dialog" role="dialog" aria-modal="true" aria-label="\u5207\u6362\u6574\u7406\u7B56\u7565" data-action="stop"><header><h3>\u5207\u6362\u7B56\u7565</h3><button class="icon-button" data-action="organize-strategy-cancel" aria-label="\u5173\u95ED">${icon("close", 16)}</button></header><div class="mini-dialog-body strategy-body">${cards}${structureList}${groupList}</div><footer class="strategy-footer"><button class="button" data-action="organize-plan-reset" data-group="${escapeHtml(group.id)}">${icon("restart", 14)}\u9ED8\u8BA4\u7B56\u7565</button><div class="button-row"><button class="button" data-action="organize-strategy-cancel">\u53D6\u6D88</button><button class="button primary" data-action="organize-strategy-apply" data-group="${escapeHtml(group.id)}"${dialog.applying ? " disabled" : ""}>${dialog.applying ? `${icon("loading", 14, "spin")}\u5E94\u7528\u4E2D\u2026` : "\u786E\u5B9A"}</button></div></footer></section></div>`;
@@ -24672,7 +25195,7 @@ ${end.comment}` : end.comment;
     const draft = ui.settings.draft;
     if (ui.settings.picker) return renderFolderPicker(ui);
       if (ui.settings.tab === "general") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("settings", 17)}</span><div><h3>\u5916\u89C2\u4E0E\u4EFB\u52A1</h3><p>\u4E3B\u9898\u4F1A\u5E94\u7528\u5230\u6240\u6709\u52A9\u624B\u5F39\u7A97\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u4E3B\u9898</span><select data-config="appearance.theme"><option value="system" ${draft.appearance.theme === "system" ? "selected" : ""}>\u8DDF\u968F\u7CFB\u7EDF</option><option value="light" ${draft.appearance.theme === "light" ? "selected" : ""}>\u6D45\u8272</option><option value="dark" ${draft.appearance.theme === "dark" ? "selected" : ""}>\u6DF1\u8272</option></select></label><label class="check-line"><input type="checkbox" data-config="appearance.compactRows" ${draft.appearance.compactRows ? "checked" : ""}>\u4F7F\u7528\u7D27\u51D1\u8868\u683C\u884C</label></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("waveform", 17)}</span><div><h3>\u6587\u4EF6\u5143\u6570\u636E\u8BC6\u522B</h3><p>\u4EC5\u5728\u6D4F\u89C8\u5668\u672C\u5730\u901A\u8FC7 123 \u76F4\u94FE\u3001Range \u5206\u6BB5\u548C MediaInfo WASM \u89E3\u6790\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u5A92\u4F53\u5185\u5BB9\u3002</p></div></div></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("share", 17)}</span><div><h3>\u5206\u4EAB\u4E0E\u79D2\u4F20</h3><p>\u53EF\u5728\u5206\u4EAB\u521B\u5EFA\u6210\u529F\u540E\u76F4\u63A5\u53D1\u9001\u5230\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\uFF0C\u7531\u670D\u52A1\u751F\u6210\u5E76\u63A8\u9001\u6295\u7A3F\u8349\u7A3F\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="field"><span>\u5206\u4EAB\u5230\u671F\u65F6\u95F4</span><input data-config="share.expiration" value="${escapeHtml(draft.share.expiration)}"></label><label class="field"><span>\u968F\u673A\u53E3\u4EE4\u957F\u5EA6</span><input type="number" min="1" max="8" data-config="share.passwordLength" value="${draft.share.passwordLength}"></label><label class="check-line full"><input type="checkbox" data-config="share.autoSubmitEnabled" ${draft.share.autoSubmitEnabled ? "checked" : ""}>\u5206\u4EAB\u540E\u81EA\u52A8\u63A8\u9001\u5230\u6295\u7A3F\u673A\u5668\u4EBA</label><label class="field full"><span>\u6295\u7A3F\u5730\u5740</span><input data-config="share.submissionUrl" value="${escapeHtml(draft.share.submissionUrl || "")}" placeholder="\u8BF7\u8F93\u5165\u5B8C\u6574\u6295\u7A3F\u63A5\u53E3\u5730\u5740"><small>\u811A\u672C\u4F1A\u5411\u6B64\u5730\u5740\u53D1\u9001 POST \u8BF7\u6C42\uFF1B\u53EF\u586B\u5199 123Cloud \u6216\u5176\u4ED6\u517C\u5BB9\u6295\u7A3F\u670D\u52A1\u7684\u5B8C\u6574\u63A5\u53E3\u5730\u5740\u3002</small></label><label class="field full"><span>\u5F71\u5E93\u63A5\u53E3\u5730\u5740\uFF08123Cloud \u5BA2\u6237\u7AEF\uFF09</span><input data-config="share.libraryUrl" value="${escapeHtml(draft.share.libraryUrl || "")}" placeholder="\u4F8B\u5982 http://127.0.0.1:62156\uFF0C\u53EF\u5E26 ?token="><small>\u586B\u5BA2\u6237\u7AEF\u5730\u5740\u5373\u53EF\uFF0C\u7AEF\u53E3\u770B\u5BA2\u6237\u7AEF\u300C\u8BBE\u7F6E \u2192 \u670D\u52A1\u7AEF\u53E3\u300D\uFF08\u540C\u6295\u7A3F\u7AEF\u53E3\uFF09\uFF1B\u54EA\u91CC\u80FD\u8FDE\u4E0A\u5C31\u586B\u54EA\u91CC\uFF0C\u7528\u4E8E\u79D2\u4F20\u5DE5\u5177\u7BB1\u7684\u300C\u5F71\u5E93\u641C\u7D22\u300D\u3002</small></label><label class="field"><span>\u5F71\u5E93\u8BBF\u95EE\u4EE4\u724C</span><input data-config="share.libraryToken" value="${escapeHtml(draft.share.libraryToken || "")}" placeholder="\u5BA2\u6237\u7AEF\u300C\u5F71\u5E93\uFF0D\u5F71\u5E93\u8BBE\u7F6E\u300D\u91CC\u751F\u6210\uFF0C\u672A\u8BBE\u7F6E\u53EF\u7559\u7A7A"></label></div></div></div>`;
-    if (ui.settings.tab === "tmdb") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("cloud", 17)}</span><div><h3>TMDB \u8FDE\u63A5</h3><p>\u7528\u4E8E\u5A92\u4F53\u6D77\u62A5\u3001\u6807\u9898\u3001\u5E74\u4EFD\u548C\u5267\u96C6\u4FE1\u606F\u3002</p></div></div>${notice("\u4EE5 ey \u5F00\u5934\u7684\u503C\u6309 Read Access Token \u4F7F\u7528\uFF0C\u5176\u4ED6\u503C\u6309 v3 API Key \u4F7F\u7528\u3002\u65E0\u6CD5\u76F4\u8FDE TMDB \u65F6\u53EF\u586B\u5199\u4E0B\u65B9\u7684\u7B2C\u4E09\u65B9\u66FF\u4EE3\u6E90\uFF08\u81EA\u5EFA\u53CD\u4EE3/\u955C\u50CF\u5730\u5740\uFF0C\u586B\u5230\u542B /3 \u4E3A\u6B62\uFF1B\u53EA\u586B\u57DF\u540D\u4F1A\u81EA\u52A8\u8865 /3\uFF0Chttps:// \u524D\u7F00\u53EF\u7701\u7565\uFF09\uFF0C\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9\u6E90\u3002", "", "cloud")}<div class="form-card"><div class="form-grid"><label class="field full"><span>API Key / Read Access Token</span><input type="password" autocomplete="off" data-config="tmdb.credential" value="${escapeHtml(draft.tmdb.credential)}"></label><label class="field full"><span>TMDB \u66FF\u4EE3\u6E90\uFF08\u65E0\u6CD5\u76F4\u8FDE\u65F6\u4F7F\u7528\uFF09</span><input data-config="tmdb.apiBase" value="${escapeHtml(draft.tmdb.apiBase || "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9 api.themoviedb.org" spellcheck="false" autocomplete="off"></label><label class="field"><span>\u8BED\u8A00</span><input data-config="tmdb.language" value="${escapeHtml(draft.tmdb.language)}"></label><label class="field"><span>\u5730\u533A</span><input data-config="tmdb.region" value="${escapeHtml(draft.tmdb.region)}"></label><label class="check-line full"><input type="checkbox" data-config="tmdb.showAllSpecials" ${draft.tmdb.showAllSpecials ? "checked" : ""}>\u6821\u51C6\u5019\u9009\u663E\u793A\u5168\u90E8 S00 \u7279\u5178\uFF08\u4E0D\u6309\u65E5\u671F/\u5173\u952E\u8BCD\u8FC7\u6EE4\uFF09</label></div></div><button class="button" data-action="tmdb-test">${icon("refresh", 15)}\u6D4B\u8BD5\u8FDE\u63A5</button></div>`;
+    if (ui.settings.tab === "tmdb") return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("cloud", 17)}</span><div><h3>TMDB \u8FDE\u63A5</h3><p>\u7528\u4E8E\u5A92\u4F53\u6D77\u62A5\u3001\u6807\u9898\u3001\u5E74\u4EFD\u548C\u5267\u96C6\u4FE1\u606F\u3002</p></div></div>${notice("\u4EE5 ey \u5F00\u5934\u7684\u503C\u6309 Read Access Token \u4F7F\u7528\uFF0C\u5176\u4ED6\u503C\u6309 v3 API Key \u4F7F\u7528\u3002\u65E0\u6CD5\u76F4\u8FDE TMDB \u65F6\u53EF\u586B\u5199\u4E0B\u65B9\u7684\u7B2C\u4E09\u65B9\u66FF\u4EE3\u6E90\uFF08\u81EA\u5EFA\u53CD\u4EE3/\u955C\u50CF\u5730\u5740\uFF0C\u586B\u5230\u542B /3 \u4E3A\u6B62\uFF1B\u53EA\u586B\u57DF\u540D\u4F1A\u81EA\u52A8\u8865 /3\uFF0Chttps:// \u524D\u7F00\u53EF\u7701\u7565\uFF09\uFF0C\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9\u6E90\u3002", "", "cloud")}<div class="form-card"><div class="form-grid"><label class="field full"><span>API Key / Read Access Token</span><input type="password" autocomplete="off" data-config="tmdb.credential" value="${escapeHtml(draft.tmdb.credential)}"></label><label class="field full"><span>TMDB \u66FF\u4EE3\u6E90\uFF08\u65E0\u6CD5\u76F4\u8FDE\u65F6\u4F7F\u7528\uFF09</span><input data-config="tmdb.apiBase" value="${escapeHtml(draft.tmdb.apiBase || "")}" placeholder="\u7559\u7A7A\u4F7F\u7528\u5B98\u65B9 api.themoviedb.org" spellcheck="false" autocomplete="off"></label><label class="field"><span>\u8BED\u8A00</span><input data-config="tmdb.language" value="${escapeHtml(draft.tmdb.language)}"></label><label class="field"><span>\u5730\u533A</span><input data-config="tmdb.region" value="${escapeHtml(draft.tmdb.region)}"></label><label class="check-line full"><input type="checkbox" data-config="tmdb.showAllSpecials" ${draft.tmdb.showAllSpecials ? "checked" : ""}>\u6821\u51C6\u5019\u9009\u663E\u793A\u5168\u90E8 S00 \u7279\u5178\uFF08\u4E0D\u6309\u65E5\u671F/\u5173\u952E\u8BCD\u8FC7\u6EE4\uFF09</label></div></div><button class="button" data-action="tmdb-test">${icon("refresh", 15)}\u6D4B\u8BD5\u8FDE\u63A5</button></div><div class="settings-section"><div class="section-head"><span class="section-icon">${icon("sparkles", 17)}</span><div><h3>AI \u8F85\u52A9\u8BC6\u522B</h3><p>\u811A\u672C\u8BA4\u4E0D\u51FA\u7247\u540D\u3001\u6216\u5728\u591A\u6761\u540C\u540D\u7247\u91CC\u6311\u9519\u65F6\uFF0C\u4EA4\u7ED9\u5927\u6A21\u578B\u5E2E\u5FD9\u5224\u65AD\uFF1BTMDB \u6761\u76EE\u4ECD\u7531\u811A\u672C\u81EA\u5DF1\u53BB\u67E5\u3001\u53BB\u6821\u9A8C\uFF0C\u6A21\u578B\u7F16\u4E0D\u51FA ID\u3002</p></div></div><div class="form-card"><div class="form-grid"><label class="check-line full"><input type="checkbox" data-config="ai.enabled" ${draft.ai.enabled ? "checked" : ""}>\u542F\u7528 AI \u8F85\u52A9\u8BC6\u522B\uFF08\u9700\u586B\u5199\u4E0B\u9762\u7684\u63A5\u53E3\u5730\u5740\u3001\u6A21\u578B\u4E0E\u5BC6\u94A5\uFF09</label><label class="field full"><span>\u63A5\u53E3\u5730\u5740\uFF08OpenAI \u517C\u5BB9\uFF0C\u586B\u5230 /v1 \u4E3A\u6B62\uFF09</span><input data-config="ai.apiBase" value="${escapeHtml(draft.ai.apiBase || "")}" placeholder="https://api.deepseek.com/v1" spellcheck="false" autocomplete="off"></label><label class="field"><span>\u6A21\u578B</span><input data-config="ai.model" value="${escapeHtml(draft.ai.model || "")}" placeholder="deepseek-flash"></label><label class="field"><span>API Key</span><input type="password" autocomplete="off" data-config="ai.credential" value="${escapeHtml(draft.ai.credential || "")}"></label><label class="check-line full"><input type="checkbox" data-config="ai.rerank" ${draft.ai.rerank ? "checked" : ""}>\u811A\u672C\u5728\u540C\u7CFB\u5217\u591A\u6761\u5019\u9009\u91CC\u9009\u4E0D\u5B9A\u65F6\uFF0C\u8BA9 AI \u590D\u6838\u6311\u5BF9\u7684\u90A3\u6761</label></div></div><button class="button" data-action="ai-test">${icon("refresh", 15)}\u6D4B\u8BD5\u8FDE\u63A5</button></div>`;
     if (ui.settings.tab === "library") return renderLibrary(ui);
     if (ui.settings.tab === "naming") return renderNaming(ui);
     return `<div class="settings-section"><div class="section-head"><span class="section-icon">${icon("save", 17)}</span><div><h3>\u914D\u7F6E\u5907\u4EFD</h3><p>\u5BFC\u51FA\u6587\u4EF6\u9ED8\u8BA4\u4E0D\u5305\u542B TMDB \u51ED\u636E\u3002</p></div></div>${notice("\u9700\u8981\u8FC1\u79FB\u51ED\u636E\u65F6\u53EF\u4E34\u65F6\u52FE\u9009\uFF0C\u5BFC\u51FA\u540E\u8BF7\u59A5\u5584\u4FDD\u7BA1\u3002", "", "alert")}<div class="form-card"><label class="check-line"><input id="backup-secrets" type="checkbox">\u5BFC\u51FA\u65F6\u5305\u542B TMDB \u51ED\u636E</label><div class="button-row"><button class="button" data-action="config-export">${icon("download", 15)}\u5BFC\u51FA\u914D\u7F6E</button><button class="button" data-action="config-import">${icon("import", 15)}\u5BFC\u5165\u914D\u7F6E</button><button class="button danger" data-action="config-reset">${icon("trash", 15)}\u6062\u590D\u9ED8\u8BA4</button><input id="config-file" type="file" accept="application/json" hidden></div></div></div>`;
@@ -25671,11 +26194,12 @@ ${end.comment}` : end.comment;
     return videos.sort((left, right) => Number(right.size || 0) - Number(left.size || 0) || naturalCompare(left.relativePath || left.name, right.relativePath || right.name))[0] || null;
   }
   var AssistantUi = class {
-    constructor({ api, bridge, configStore, tmdb, metadata, submissionClient }) {
+    constructor({ api, bridge, configStore, tmdb, ai, metadata, submissionClient }) {
       this.api = api;
       this.bridge = bridge;
       this.configStore = configStore;
       this.tmdb = tmdb;
+      this.ai = ai || null;
       this.metadata = metadata;
       this.submissionClient = submissionClient || new SubmissionClient();
       this.config = configStore.get();
@@ -27529,6 +28053,7 @@ ${end.comment}` : end.comment;
         currentDirName: this.organize.currentDirName || "",
         inPlace: location2 === "inPlace",
         naming: "normalized",
+        ai: this.ai,
         mediaByGroup: this.organize.mediaByGroup,
         overrides: this.organize.overrides,
         episodeLocks: this.organize.episodeLocks,
@@ -27744,34 +28269,45 @@ ${end.comment}` : end.comment;
       dialog.structuresLoading = true;
       dialog.structuresError = "";
       dialog.structuresInfo = "";
+      // 本地 TMDB 结构立刻上屏：读外部源（CureTMDb / Bangumi）慢或不通时也能马上切换、马上应用，
+      // 不再空转等两个外部源 settle（原来最长会卡在「读取中」很久，看起来像切换没反应）。
+      const tmdbStructure = tmdbStructureFromMedia(media);
+      const external = [];
+      const errors = [];
+      const notes = [];
+      dialog.structuresList = [tmdbStructure];
       this.render();
-      try {
-        const [cureResult, bangumiResult] = await Promise.allSettled([loadCureTmdbTvStructure(media.id), loadBangumiStructureForMedia(media)]);
-        const list = [];
-        const notes = [];
-        const errors = [];
-        if (cureResult.status === "fulfilled" && cureResult.value) list.push(cureResult.value);
-        else if (cureResult.status === "rejected") errors.push(`CureTMDb\uFF1A${cureResult.reason?.message || "\u8BFB\u53D6\u5931\u8D25"}`);
-        if (bangumiResult.status === "fulfilled" && bangumiResult.value) list.push(bangumiResult.value);
-        else if (bangumiResult.status === "fulfilled") notes.push("Bangumi \u6CA1\u6709\u5339\u914D\u5230\u8FD9\u90E8\u5267\uFF08\u6807\u9898\u4E0D\u4E00\u81F4\u6216\u672A\u6536\u5F55\uFF09\uFF0C\u53EA\u80FD\u7528 TMDB \u5B98\u65B9\u5206\u5B63");
-        else errors.push(`Bangumi\uFF1A${bangumiResult.reason?.message || "\u8BFB\u53D6\u5931\u8D25"}`);
-        list.push(tmdbStructureFromMedia(media));
-        for (const structure of list) this.organize.structureCache[strategyStructureCacheKey(media, structure.source)] = structure;
-        dialog.structuresList = list;
-        dialog.structuresInfo = notes.join("\uFF1B");
-        if (!list.some((item) => item.source !== "tmdb")) dialog.structuresError = errors.join("\uFF1B");
-        else if (errors.length) dialog.structuresInfo = [...errors, ...notes].join("\uFF1B");
-        if (!dialog.structureSource || !list.some((item) => item.source === dialog.structureSource)) {
-          // 合并策略：单期结构（柯南式全作一entry）也照样有用，真实源无论单多期都优先
-          const prefer = (source) => list.find((item) => item.source === source && (dialog.pick === "merge" || !structureIsSingleSeason(item)));
-          const preferred = prefer("curetmdb") || prefer("bangumi") || list.find((item) => item.source === "curetmdb") || list[0];
+      const settle = () => {
+        if (this.organize?.strategyDialog !== dialog) return;
+        dialog.structuresList = [...external, tmdbStructure];
+        dialog.structuresInfo = [...errors, ...notes].join("\uFF1B");
+        dialog.structuresError = external.length ? "" : errors.join("\uFF1B");
+        // 只在当前选择为空、或已不在列表里时才自动挑源；用户手动选过的数据源不会被覆盖
+        if (!dialog.structureSource || !dialog.structuresList.some((item) => item.source === dialog.structureSource)) {
+          // 合并策略：单期结构（柯南式全作一 entry）也照样有用，真实源无论单多期都优先
+          const prefer = (source) => dialog.structuresList.find((item) => item.source === source && (dialog.pick === "merge" || !structureIsSingleSeason(item)));
+          const preferred = prefer("curetmdb") || prefer("bangumi") || dialog.structuresList.find((item) => item.source === "curetmdb") || dialog.structuresList[0];
           dialog.structureSource = preferred.source;
         }
-      } finally {
-        if (this.organize?.strategyDialog === dialog) {
-          dialog.structuresLoading = false;
-          this.render();
-        }
+        this.render();
+      };
+      const accept = (structure) => {
+        if (!structure) return false;
+        external.push(structure);
+        this.organize.structureCache[strategyStructureCacheKey(media, structure.source)] = structure;
+        return true;
+      };
+      await Promise.all([
+        loadCureTmdbTvStructure(media.id).then((value) => {
+          if (!accept(value)) notes.push("CureTMDb \u672A\u6536\u5F55\u8FD9\u90E8\u4F5C\u54C1\uFF08\u793E\u533A\u5206\u5B63\u8868\u6761\u76EE\u8F83\u5C11\uFF09");
+        }, (error) => errors.push(`CureTMDb\uFF1A${error?.message || "\u8BFB\u53D6\u5931\u8D25"}`)).then(settle),
+        loadBangumiStructureForMedia(media).then((value) => {
+          if (!accept(value)) notes.push("Bangumi \u6CA1\u6709\u5339\u914D\u5230\u8FD9\u90E8\u5267\uFF08\u6807\u9898\u4E0D\u4E00\u81F4\u6216\u672A\u6536\u5F55\uFF09");
+        }, (error) => errors.push(`Bangumi\uFF1A${error?.message || "\u8BFB\u53D6\u5931\u8D25"}`)).then(settle)
+      ]);
+      if (this.organize?.strategyDialog === dialog) {
+        dialog.structuresLoading = false;
+        settle();
       }
     }
     updateOrganizeNameMirror(textarea, value, seasonEpisode) {
@@ -28849,7 +29385,9 @@ ${end.comment}` : end.comment;
         },
         "organize-strategy-reload": () => {
           const dialog = this.organize.strategyDialog;
-          if (dialog && kindIsSplitStrategy(dialog.pick)) void this.loadOrganizeSplitStructures();
+          if (!dialog) return;
+          // 拆分与合并吃的是分季结构，重试要走结构读取；其余（剧集组）才读 TMDB 剧集组。
+          if (strategyUsesStructure(dialog.pick)) void this.loadOrganizeSplitStructures();
           else void this.loadOrganizeEpisodeGroups();
         },
         "organize-strategy-cancel": () => {
@@ -28933,6 +29471,7 @@ ${end.comment}` : end.comment;
         },
         "settings-save": () => this.saveSettings(),
         "tmdb-test": () => this.testTmdb(),
+        "ai-test": () => this.testAi(),
         "recognition-add-exclude": () => {
           const input = this.root.querySelector("#recognition-exclude");
           const word = String(input?.value || "").trim();
@@ -29187,6 +29726,20 @@ ${end.comment}` : end.comment;
         await this.tmdb.test();
         const base = this.tmdb.apiBase();
         this.toast(base === API_BASE ? "TMDB \u8FDE\u63A5\u6210\u529F" : `TMDB \u8FDE\u63A5\u6210\u529F\uFF08\u66FF\u4EE3\u6E90\uFF1A${base}\uFF09`, "success");
+      } finally {
+        this.configStore.set(previous);
+      }
+    }
+    async testAi() {
+      const previous = this.configStore.get();
+      this.configStore.set(this.settings.draft);
+      try {
+        if (!this.ai) throw new Error("AI 客户端未初始化");
+        if (!this.ai.available()) throw new Error(this.ai.trippedAt ? "AI 已熔断（连续失败），请检查接口与密钥" : "请先填写接口地址、模型与 API Key");
+        await this.ai.complete([{ role: "user", content: "只回复两个字：正常" }], { timeoutMs: 2e4 });
+        this.toast("AI 连接成功", "success");
+      } catch (error) {
+        this.toast(`AI 连接失败：${error.message}`, "error");
       } finally {
         this.configStore.set(previous);
       }
@@ -29792,8 +30345,9 @@ ${end.comment}` : end.comment;
         });
         const bridge = new PageBridge(api, config);
         const tmdb = new TmdbClient(() => configStore.get().tmdb);
+        const ai = new AiClient(() => configStore.get().ai);
         const metadata = new MediaMetadataClient({ api });
-        const ui = new AssistantUi({ api, bridge, configStore, tmdb, metadata });
+        const ui = new AssistantUi({ api, bridge, configStore, tmdb, ai, metadata });
         ui.init();
         registerSettingsMenu(ui);
         bridge.init();

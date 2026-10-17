@@ -49,7 +49,7 @@ globalThis.__anime = {
   loadBangumiStructureForMedia,
   activeBangumiHost: () => bangumiActiveHost,
   BANGUMI_API_HOSTS,
-  CURE_TMDB_TV_JSON_URL,
+  CURE_TMDB_TV_JSON_URLS,
   CURE_TMDB_TV_CACHE_KEY,
   BANGUMI_STRUCTURE_CACHE_PREFIX
 };
@@ -57,7 +57,9 @@ globalThis.__anime = {
 const sandbox = { console, Date, Math, JSON, Number, String, Array, Object, Set, Map, RegExp, Intl, Symbol, Error, Promise, fetch: fakeFetch, GM_getValue: (key, fallback = null) => (gmStore.has(key) ? gmStore.get(key) : fallback), GM_setValue: (key, value) => { gmStore.set(key, value); } };
 vm.createContext(sandbox);
 vm.runInContext(code + driver, sandbox, { filename: "123-helper.user.js" });
-const { BangumiClient, bangumiClient, bangumiClientCacheClear, loadCureTmdbTvMap, loadCureTmdbTvStructure, loadBangumiStructureForMedia, activeBangumiHost, BANGUMI_API_HOSTS, CURE_TMDB_TV_JSON_URL, CURE_TMDB_TV_CACHE_KEY, BANGUMI_STRUCTURE_CACHE_PREFIX } = sandbox.__anime;
+const { BangumiClient, bangumiClient, bangumiClientCacheClear, loadCureTmdbTvMap, loadCureTmdbTvStructure, loadBangumiStructureForMedia, activeBangumiHost, BANGUMI_API_HOSTS, CURE_TMDB_TV_JSON_URLS, CURE_TMDB_TV_CACHE_KEY, BANGUMI_STRUCTURE_CACHE_PREFIX } = sandbox.__anime;
+// CureTMDb 现在有多个镜像（jsDelivr 优先、raw.githubusercontent 兜底），按「任一镜像」匹配。
+const CURE_MIRROR_RE = /(?:cdn\.jsdelivr\.net\/gh\/wikrin\/CureTMDb@main|raw\.githubusercontent\.com\/wikrin\/CureTMDb\/main)\/tv\.json/;
 
 const plain = (value) => JSON.parse(JSON.stringify(value));
 let passed = 0;
@@ -84,7 +86,7 @@ const SUBJECT_369304 = { id: 369304, type: 2, platform: "TV", name: "呪術廻�
 const JUJUTSU_MEDIA = { id: 95479, mediaType: "tv", title: "咒术回战", originalTitle: "呪術廻戦", chineseTitles: ["咒术回战"], year: "2020" };
 const installJujutsuRoutes = () => {
   routes = [
-    { method: "GET", match: /raw\.githubusercontent\.com\/wikrin\/CureTMDb\/main\/tv\.json/, body: SAMPLE_TV_JSON },
+    { method: "GET", match: CURE_MIRROR_RE, body: SAMPLE_TV_JSON },
     { method: "POST", match: /\/v0\/search\/subjects/, body: { data: [{ id: 294993, type: 2, platform: "TV", name: "呪術廻戦", name_cn: "咒术回战", date: "2020-10-02" }] } },
     { method: "GET", match: /\/v0\/subjects\/294993\/subjects/, body: [{ id: 369304, type: 2, relation: "续集", name: "呪術廻戦 懐玉・玉折", name_cn: "咒术回战 怀玉·玉折 / 涩谷事变", date: "2023-07-06" }] },
     { method: "GET", match: /\/v0\/subjects\/369304\/subjects/, body: [] },
@@ -123,23 +125,23 @@ test("BangumiClient：反代故障自动回退官方域名", async () => {
 test("loadCureTmdbTvStructure：拉社区表解析结构，24h 内走缓存", async () => {
   gmStore.clear();
   fetchCalls.length = 0;
-  routes = [{ method: "GET", match: /raw\.githubusercontent\.com\/wikrin\/CureTMDb\/main\/tv\.json/, body: SAMPLE_TV_JSON }];
+  routes = [{ method: "GET", match: CURE_MIRROR_RE, body: SAMPLE_TV_JSON }];
   const structure = await loadCureTmdbTvStructure(95479);
   assert.equal(structure.source, "curetmdb");
   assert.equal(structure.name, "咒术回战");
   assert.deepEqual(plain(structure.seasons.map((season) => [season.season, season.count])), [[1, 24], [2, 23]]);
-  const githubCalls = () => fetchCalls.filter((item) => item.url === CURE_TMDB_TV_JSON_URL).length;
-  assert.equal(githubCalls(), 1);
+  const mirrorCalls = () => fetchCalls.filter((item) => CURE_TMDB_TV_JSON_URLS.includes(item.url)).length;
+  assert.equal(mirrorCalls(), 1);
   // 第二次读缓存，不再发请求
   await loadCureTmdbTvStructure(95479);
-  assert.equal(githubCalls(), 1);
+  assert.equal(mirrorCalls(), 1);
   // 表里没有的 id → null
   assert.equal(await loadCureTmdbTvStructure(999999), null);
 });
 
 test("loadCureTmdbTvMap：网络失败报错且不写缓存", async () => {
   gmStore.clear();
-  routes = [{ method: "GET", match: /raw\.githubusercontent\.com/, status: 503, body: {} }];
+  routes = [{ method: "GET", match: /(?:cdn\.jsdelivr\.net|raw\.githubusercontent\.com)/, status: 503, body: {} }];
   await assert.rejects(loadCureTmdbTvMap());
   assert.equal(gmStore.has(CURE_TMDB_TV_CACHE_KEY), false);
 });
