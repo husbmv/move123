@@ -6,8 +6,8 @@
 - 429 / 5xx 不自动重试，把状态原样交给前端提示
 - 每批 SHA1 秒传 ≤20 条、条间隔 ≥1 秒
 
-配置复用秒传池的环境变量（SHA1_POOL_API_URL / SHA1_POOL_API_TOKEN / SHA1_POOL_API_CA），
-未配置时整个功能停用。日志与流量中不出现 Token。
+配置复用秒传池的环境变量（SHA1_POOL_API_URL / SHA1_POOL_API_TOKEN / SHA1_POOL_API_CA /
+SHA1_POOL_API_INSECURE），未配置时整个功能停用。日志与流量中不出现 Token。
 """
 
 from __future__ import annotations
@@ -22,7 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from .sha1_cloud import (
-    _build_ssl_context, _normalize_name, _normalize_sha1, _normalize_size, get_pool_token_override,
+    _build_ssl_context, _normalize_name, _normalize_sha1, _normalize_size,
+    _pool_api_insecure, get_pool_token_override,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ _REUSE_BATCH_MAX = 20
 _REUSE_INTERVAL = 1.0
 
 
-def _load_config() -> Optional[Dict[str, str]]:
+def _load_config() -> Optional[Dict[str, Any]]:
     url = str(os.environ.get("SHA1_POOL_API_URL") or "").strip().rstrip("/")
     token = str(os.environ.get("SHA1_POOL_API_TOKEN") or "").strip()
     ca = str(os.environ.get("SHA1_POOL_API_CA") or "").strip()
@@ -42,7 +43,7 @@ def _load_config() -> Optional[Dict[str, str]]:
         return None
     if ca and not os.path.isfile(ca):
         ca = ""
-    return {"url": url, "token": token, "ca": ca}
+    return {"url": url, "token": token, "ca": ca, "insecure": _pool_api_insecure()}
 
 
 class PoolSearchClient:
@@ -90,7 +91,12 @@ class PoolSearchClient:
             return {"available": True, "results": cached[1], "cached": True, "error": ""}
 
         try:
-            verify = _build_ssl_context(config["ca"]) if config["ca"] else True
+            if config["insecure"]:
+                verify: Any = False  # 自签证书服务器：跳过校验，TLS 加密仍在
+            elif config["ca"]:
+                verify = _build_ssl_context(config["ca"])
+            else:
+                verify = True
             token = get_pool_token_override() or config["token"]
             async with httpx.AsyncClient(verify=verify, timeout=_SEARCH_TIMEOUT, follow_redirects=False, trust_env=False) as client:
                 response = await client.get(

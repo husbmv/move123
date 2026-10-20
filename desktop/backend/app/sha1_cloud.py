@@ -10,6 +10,8 @@
   未配置、配置不完整或非法时整个模块静默停用；
 - 连接强制 TLS 且校验服务器身份（VERIFY_CA+IDENTITY：随包分发的 CA + 证书 IP SAN），
   没有 CA 直接拒绝连接，绝不降级明文；
+- API 客户端例外：服务器换自签证书（SHA1_POOL_API_INSECURE=1）时跳过证书校验，
+  但 TLS 加密本身保留，且仍然拒绝明文 http；
 - 所有网络操作"尽力而为"：连接失败/超时一律记 WARNING 并按"没有命中"处理，
   绝不抛异常打断搬运；连续失败自动熔断几分钟（数据库客户端 3 次熔断 10 分钟，
   API 客户端 5 次熔断 5 分钟），避免不可达时拖慢任务；
@@ -144,6 +146,15 @@ def _build_ssl_context(ssl_ca: str) -> "_ssl.SSLContext":
     context.check_hostname = True
     context.verify_mode = _ssl.CERT_REQUIRED
     return context
+
+
+def _pool_api_insecure() -> bool:
+    """SHA1_POOL_API_INSECURE=1 时跳过服务器证书校验（自签证书的秒传池服务器）。
+
+    只关校验不关加密：连接仍是 TLS，且 URL 校验继续拒绝明文 http；
+    该开关优先于 SHA1_POOL_API_CA（包内旧 CA 对自签新证书必然校验失败）。
+    """
+    return str(os.environ.get("SHA1_POOL_API_INSECURE") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class Sha1CloudClient:
@@ -385,7 +396,10 @@ class Sha1ApiClient(Sha1CloudClient):
             client = self._http_clients.get(proxy)
             if client is None:
                 import httpx
-                verify = _ssl.create_default_context(cafile=os.environ.get("SHA1_POOL_API_CA") or None)
+                if _pool_api_insecure():
+                    verify: Any = False  # 自签证书服务器：跳过校验，TLS 加密仍在
+                else:
+                    verify = _ssl.create_default_context(cafile=os.environ.get("SHA1_POOL_API_CA") or None)
                 client = httpx.Client(
                     verify=verify,
                     timeout=httpx.Timeout(10.0, connect=5.0),

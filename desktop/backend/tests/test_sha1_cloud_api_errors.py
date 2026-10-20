@@ -19,13 +19,50 @@ from unittest.mock import patch
 
 import httpx
 
-from app.sha1_cloud import Sha1ApiClient
+from app.sha1_cloud import Sha1ApiClient, _pool_api_insecure
 
 
 def _status_error(code: int) -> httpx.HTTPStatusError:
     request = httpx.Request("GET", "https://pool.example/lookup")
     response = httpx.Response(code, request=request)
     return httpx.HTTPStatusError(f"HTTP {code}", request=request, response=response)
+
+
+def test_pool_api_insecure_env_parsing(monkeypatch):
+    """SHA1_POOL_API_INSECURE 只认显式开启的写法，未设/0/off 都视为保持校验。"""
+    monkeypatch.delenv("SHA1_POOL_API_INSECURE", raising=False)
+    assert _pool_api_insecure() is False
+    for value in ("0", "off", "false", "no", "", "  "):
+        monkeypatch.setenv("SHA1_POOL_API_INSECURE", value)
+        assert _pool_api_insecure() is False
+    for value in ("1", "true", "TRUE", "Yes", "on"):
+        monkeypatch.setenv("SHA1_POOL_API_INSECURE", value)
+        assert _pool_api_insecure() is True
+
+
+def test_http_client_insecure_skips_cert_verification(monkeypatch):
+    """自签证书服务器：INSECURE=1 时 verify=False（TLS 加密仍在）；关掉后恢复证书校验。"""
+    import ssl as _ssl
+
+    captured = {}
+
+    def fake_client_factory(**kwargs):
+        captured.update(kwargs)
+        return object()  # 只验证构造参数，不真正建连
+
+    monkeypatch.setattr(httpx, "Client", fake_client_factory)
+    client = Sha1ApiClient()
+    monkeypatch.setenv("SHA1_POOL_API_INSECURE", "1")
+    monkeypatch.setenv("SHA1_POOL_API_CA", "/nonexistent/ca.pem")  # INSECURE 优先于 CA
+    assert client._http_client(None) is not None
+    assert captured["verify"] is False
+
+    monkeypatch.delenv("SHA1_POOL_API_INSECURE", raising=False)
+    monkeypatch.delenv("SHA1_POOL_API_CA", raising=False)
+    client2 = Sha1ApiClient()
+    captured.clear()
+    client2._http_client(None)
+    assert isinstance(captured["verify"], _ssl.SSLContext)
 
 
 def test_http_status_error_brief_shows_code_and_meaning():

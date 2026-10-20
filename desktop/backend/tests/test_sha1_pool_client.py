@@ -208,6 +208,34 @@ def test_search_uses_token_override(fake_http, monkeypatch: pytest.MonkeyPatch) 
     assert http.last_kwargs["headers"]["Authorization"] == "Bearer " + "admin" * 12
 
 
+def test_search_insecure_skips_cert_verification(monkeypatch: pytest.MonkeyPatch) -> None:
+    """自签证书服务器：SHA1_POOL_API_INSECURE=1 时搜索请求 verify=False（TLS 加密仍在）。"""
+    captured: dict = {}
+    real_factory = sha1_pool.httpx.AsyncClient
+
+    def factory(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        kwargs["transport"] = httpx_transport_passthrough()
+        kwargs.pop("verify", None)
+        return real_factory(**kwargs)
+
+    monkeypatch.setattr(sha1_pool.httpx, "AsyncClient", factory)
+    monkeypatch.setenv("SHA1_POOL_API_INSECURE", "1")
+    data = asyncio.run(sha1_pool.pool_search_client.search("kw"))
+    assert data["available"] is True
+    assert captured["verify"] is False
+
+
+def httpx_transport_passthrough():
+    """真实 AsyncClient 需要可用的传输层：这里不打网络，仅在构造期合法即可。"""
+    import httpx
+
+    def handler(request) -> httpx.Response:  # pragma: no cover - 不会真正发出请求
+        return httpx.Response(200, json={"results": []})
+
+    return httpx.MockTransport(handler)
+
+
 def test_reset_state_allows_reprobe_after_403(fake_http) -> None:
     """设置页切换 Token 后要清掉 403 停用标记，让新 Token 重新探测。"""
     http = fake_http([FakeResponse(403, {"error": "forbidden"}), FakeResponse(200, {"results": []})])
