@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 import httpx
+from .network_proxy import httpx_proxy, telegram_telethon_proxy
 
 from .defaults import DEFAULT_SUBMISSION_CONFIG
 from .pan115 import (
@@ -211,6 +212,7 @@ async def start_telegram_client() -> None:
     await close_telegram_client()
     _telegram_client = httpx.AsyncClient(
         timeout=30.0,
+        proxy=httpx_proxy("tg"),
         limits=httpx.Limits(max_connections=6, max_keepalive_connections=6, keepalive_expiry=30.0),
     )
     _telegram_client_loop = loop
@@ -239,6 +241,7 @@ def _telegram_request_client() -> tuple[httpx.AsyncClient, bool]:
     return (
         httpx.AsyncClient(
             timeout=30.0,
+            proxy=httpx_proxy("tg"),
             limits=httpx.Limits(max_connections=6, max_keepalive_connections=6, keepalive_expiry=30.0),
         ),
         True,
@@ -2954,10 +2957,11 @@ async def publish_submission_draft(store: SessionStore, bot_token: str, config: 
     draft["channelId"] = str(channel.get("id") or "")
     draft["channelTitle"] = str(channel.get("title") or "")
     draft["channelChatId"] = chat_id
-    caption = render_submission_caption(draft, config, store, include_route=False)
+    caption = str(draft.get("autoPublishCaption") or "") or render_submission_caption(draft, config, store, include_route=False)
 
     async def publish_once() -> Dict[str, Any]:
-        sent = await send_telegram_rich_message(bot_token, chat_id, caption, media_photo(draft), build_publish_markup(draft, config), parse_mode="HTML", config=config)
+        auto_caption = bool(draft.get("autoPublishCaption"))
+        sent = await send_telegram_rich_message(bot_token, chat_id, caption, None if auto_caption else media_photo(draft), None if auto_caption else build_publish_markup(draft, config), parse_mode="HTML", config=config)
         message_id = telegram_message_id(sent)
         if message_id <= 0:
             raise ValueError("Telegram 未返回频道消息 ID")
@@ -2978,7 +2982,7 @@ async def publish_submission_draft(store: SessionStore, bot_token: str, config: 
         await safe_answer_callback_query(bot_token, callback_id, "已发布", timeout=4.0)
         await cleanup_submission_draft_messages(bot_token, draft, callback_message_id_value)
         # 频道级「发布后清理旧帖」开关：关掉后本地历史删除与 TG API 全频道扫描都不跑
-        if channel_old_post_cleanup_enabled(channel):
+        if channel_old_post_cleanup_enabled(channel) and not auto_caption:
             history_warning = await cleanup_previous_submission_publications(store, bot_token, config, draft, chat_id, message_id)
             if history_warning:
                 logger.warning(
@@ -2986,7 +2990,7 @@ async def publish_submission_draft(store: SessionStore, bot_token: str, config: 
                     extra={"draft_id": str(draft.get("id") or ""), "channel_chat_id": str(chat_id), "message_id": message_id, "warning": history_warning},
                 )
         record_submission_publication(store, config, draft, channel, chat_id, message_id, ([photo_message_id] if photo_message_id > 0 else []) + seed_message_ids)
-        if channel_old_post_cleanup_enabled(channel):
+        if channel_old_post_cleanup_enabled(channel) and not auto_caption:
             schedule_published_submission_history_cleanup(store, config, draft, chat_id, message_id)
         return {"action": "publish", "ok": True, "channelId": str(channel.get("id") or ""), "messageId": message_id, "seedMessageIds": seed_message_ids}
 
@@ -3307,7 +3311,8 @@ async def send_telegram_photo_via_client(config: Dict[str, Any], chat_id: str, p
     if api_id <= 0 or not api_hash or not session:
         raise ValueError("TG API 未配置")
 
-    client = TelegramClient(StringSession(session), api_id, api_hash, connection_retries=3, retry_delay=1)
+    proxy = telegram_telethon_proxy()
+    client = TelegramClient(StringSession(session), api_id, api_hash, connection_retries=3, retry_delay=1, **({"proxy": proxy} if proxy else {}))
     await client.connect()
     try:
         if not await client.is_user_authorized():
@@ -3819,6 +3824,7 @@ def normalize_submission_draft(value: Dict[str, Any]) -> Dict[str, Any]:
         "metadata": value.get("metadata") if isinstance(value.get("metadata"), dict) else {},
         "share": value.get("share") if isinstance(value.get("share"), dict) else {},
         "inspection": value.get("inspection") if isinstance(value.get("inspection"), dict) else {},
+        **({"autoPublishCaption": value["autoPublishCaption"]} if isinstance(value.get("autoPublishCaption"), str) and value.get("autoPublishCaption") else {}),
         "documents": normalize_submission_documents(value.get("documents") or []),
         **({"databaseNote": database_note} if database_note else {}),
     }

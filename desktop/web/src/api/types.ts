@@ -25,6 +25,8 @@ export interface Pan123Session {
   profile: Pan123Profile | null;
   /** 授权已失效：refresh token 被 123 拒绝，需重新授权（头像等缓存链接会失效） */
   loginExpired?: boolean;
+  accessOnly?: boolean;
+  expiresAt?: number | null;
 }
 
 export interface Capabilities {
@@ -387,6 +389,10 @@ export interface TransferConfig {
   excludeSuffix: string;
   excludeCid: string;
   delete115AfterSuccess: boolean;
+  autoPublishFastlink: boolean;
+  tg115MonitorEnabled: boolean;
+  tg115MonitorChannel: string;
+  tg115MonitorTargetDirId: string;
   concurrency: number;
   pauseEnabled: boolean;
   pauseTimeZone: string;

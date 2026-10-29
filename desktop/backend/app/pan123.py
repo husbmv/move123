@@ -402,7 +402,7 @@ class Pan123OpenAPIClient:
     # ------------------------------------------------------------------
     @property
     def authorized(self) -> bool:
-        return bool(self._refresh_token)
+        return bool(self._refresh_token or self._access_token)
 
     async def load_authorization(self) -> Dict[str, Any]:
         """从持久层读授权数据（refresh token + 缓存的 access token），进程启动后调用一次。"""
@@ -414,7 +414,7 @@ class Pan123OpenAPIClient:
             self._refresh_token = str(stored.get("refreshToken") or "")
             cached_token = str(stored.get("accessToken") or "")
             cached_expires_at = float(stored.get("expiresAt") or 0)
-            if cached_token and cached_expires_at > time.time() + 60:
+            if cached_token:
                 self._access_token = cached_token
                 self._access_token_expires_at = cached_expires_at
         return self._snapshot()
@@ -699,6 +699,8 @@ class Pan123OpenAPIClient:
         async with self._access_token_lock:
             if self._access_token and self._access_token_expires_at > time.time() + 60:
                 return self._access_token
+            if not self._refresh_token:
+                raise Pan123Error("123 访问令牌已过期且没有刷新令牌，请到设置页重新授权")
             await self._refresh_tokens()
             return self._access_token
 

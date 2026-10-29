@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote as url_quote, urlparse
+from urllib.parse import unquote as url_unquote
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -49,6 +50,7 @@ from .pan123 import (
     Pan123OauthBroker,
     decode_oplist_callback_fragment,
     pan123_open_token_expires_at,
+    pan123_open_jwt_exp,
     parse_pan123_share_url,
 )
 from .pan115_transfer import extract_115_links
@@ -56,6 +58,8 @@ from .panlink import browse_pan123_dir, list_pan123_links, proxy_pan123_download
 from .session_store import SessionStore, positive_user_ids, utc_now_iso
 from . import sha1_cloud, sha1_pool
 from .submission import (
+    append_submission_draft,
+    build_submission_draft,
     build_submission_display_preview,
     clear_submission_drafts,
     close_telegram_client,
@@ -64,6 +68,7 @@ from .submission import (
     extract_submission_links,
     FASTLINK_RE,
     find_pending_submission_draft,
+    list_submission_drafts,
     handle_pending_submission_input,
     handle_submission_callback,
     list_submission_drafts,
@@ -72,6 +77,7 @@ from .submission import (
     inspect_submission_link,
     parse_fastlink,
     route_submission_draft,
+    publish_submission_draft,
     send_telegram_text,
     start_telegram_client,
     strip_fastlink_seed_ext,
@@ -90,6 +96,11 @@ from .telegram_session import (
     start_login,
     verify_code,
 )
+from . import web_auth
+from .transfer_autopublish import file_fastlink, file_path, publishable_files, render_reference_caption, MD5_RE
+from .telegram_115_monitor import STATUS_KEY as TG115_MONITOR_STATUS_KEY, monitor_loop as tg115_monitor_loop, normalize_channel as normalize_tg115_channel
+from .submission import format_size as submission_format_size
+from .network_proxy import httpx_proxy, set_web_proxy_url, web_proxy_url
 from .transfer_service import PAN115_ACCOUNT_COOLDOWN_MS, TransferService
 
 
@@ -178,6 +189,7 @@ sha1_cloud.set_pool_token_override(str(store.read_value("sha1PoolTokenOverride")
 pan115_recycle_cleanup_task: Optional[asyncio.Task[None]] = None
 telegram_callback_polling_task: Optional[asyncio.Task[None]] = None
 library_enrich_task: Optional[asyncio.Task[None]] = None
+tg115_monitor_task: Optional[asyncio.Task[None]] = None
 # 影库分类充实（后台懒回填）：每批条数 / 相邻请求间隔 / 无活时空闲 / 单作品失败重试阈值
 LIBRARY_ENRICH_BATCH = 40
 LIBRARY_ENRICH_REQ_GAP = 0.25
@@ -223,6 +235,11 @@ TELEGRAM_BOT_COMMANDS = [
 
 @contextlib.asynccontextmanager
 async def app_lifespan(_app: FastAPI):
+    if web_auth.enabled():
+        web_auth.initialize_account(store)
+        saved_proxy = store.read_value("web_proxy_url")
+        if isinstance(saved_proxy, str):
+            set_web_proxy_url(saved_proxy)
     await start_background_tasks()
     try:
         yield
@@ -240,11 +257,111 @@ app.add_middleware(
 )
 
 
+class _WebLogin(BaseModel):
+    username: str
+    password: str
+
+
+class _WebPasswordChange(BaseModel):
+    username: str
+    currentPassword: str
+    newPassword: str
+    newUsername: str = ""
+
+
+class _WebProxyUpdate(BaseModel):
+    url: str
+
+
+@app.middleware("http")
+async def web_auth_guard(request: Request, call_next):
+    if web_auth.enabled() and request.url.path.startswith("/api/"):
+        if request.url.path not in {"/api/web-auth/login", "/api/web-auth/state"}:
+            if not web_auth.authenticated(store, request):
+                return web_auth.unauthorized()
+            if request.method not in {"GET", "HEAD", "OPTIONS"}:
+                origin = request.headers.get("origin")
+                if origin and urlparse(origin).netloc != request.headers.get("host"):
+                    return Response(status_code=403)
+    return await call_next(request)
+
+
+@app.get("/api/web-auth/state")
+async def web_auth_state(request: Request):
+    authenticated = not web_auth.enabled() or web_auth.authenticated(store, request)
+    return {"enabled": web_auth.enabled(), "authenticated": authenticated, "username": web_auth.initialize_account(store).get("username") if web_auth.enabled() and authenticated else ""}
+
+
+@app.post("/api/web-auth/login")
+async def web_auth_login(payload: _WebLogin, request: Request):
+    if not web_auth.enabled():
+        raise HTTPException(status_code=404)
+    token = web_auth.login(store, payload.username, payload.password)
+    response = Response(content='{"ok":true}', media_type="application/json")
+    secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+    response.set_cookie(web_auth.COOKIE_NAME, token, max_age=web_auth.SESSION_TTL, httponly=True, samesite="strict", secure=secure)
+    return response
+
+
+@app.post("/api/web-auth/logout")
+async def web_auth_logout(request: Request):
+    web_auth.logout(store, request)
+    response = Response(content='{"ok":true}', media_type="application/json")
+    response.delete_cookie(web_auth.COOKIE_NAME)
+    return response
+
+
+@app.post("/api/web-auth/password")
+async def web_auth_password(payload: _WebPasswordChange):
+    if not web_auth.enabled():
+        raise HTTPException(status_code=404)
+    web_auth.change_account(store, payload.username, payload.currentPassword, payload.newPassword, payload.newUsername)
+    return {"ok": True}
+
+
+@app.get("/api/web-auth/proxy")
+async def web_proxy_config():
+    return {"ok": True, "url": web_proxy_url()}
+
+
+@app.put("/api/web-auth/proxy")
+async def update_web_proxy_config(payload: _WebProxyUpdate):
+    global _tmdb_http_client, telegram_callback_polling_task
+    if not web_auth.enabled():
+        raise HTTPException(status_code=404)
+    if payload.url.strip() == web_proxy_url():
+        return {"ok": True, "url": web_proxy_url()}
+    try:
+        set_web_proxy_url(payload.url)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    store.write_value("web_proxy_url", web_proxy_url())
+    await close_telegram_client()
+    await start_telegram_client()
+    if _tmdb_http_client is not None:
+        await _tmdb_http_client.aclose()
+        _tmdb_http_client = None
+    if telegram_callback_polling_task is not None:
+        telegram_callback_polling_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await telegram_callback_polling_task
+        telegram_callback_polling_task = asyncio.create_task(telegram_callback_polling_loop())
+    from . import telegram_history
+    if telegram_history._tg_client is not None:
+        with contextlib.suppress(Exception):
+            await telegram_history._tg_client.disconnect()
+    reset_telegram_client_state()
+    return {"ok": True, "url": web_proxy_url()}
+
+
 async def start_background_tasks() -> None:
-    global pan115_recycle_cleanup_task, telegram_callback_polling_task, library_enrich_task
+    global pan115_recycle_cleanup_task, telegram_callback_polling_task, library_enrich_task, tg115_monitor_task
     await start_telegram_client()
     transfer_service.set_queued_notifier(send_telegram_transfer_queued_messages)
     transfer_service.set_notifier(send_telegram_transfer_status_message)
+    transfer_service.set_publish_notifier(publish_completed_transfer_fastlinks)
+    if tg115_monitor_task is None or tg115_monitor_task.done():
+        tg115_monitor_task = asyncio.create_task(tg115_monitor_loop(store, transfer_service))
     transfer_service.set_cookie_notifier(send_telegram_account_expired_message)
     transfer_service.set_cleanup_notifier(cleanup_telegram_transfer_messages)
     if pan115_recycle_cleanup_task and not pan115_recycle_cleanup_task.done():
@@ -264,7 +381,7 @@ async def start_background_tasks() -> None:
 
 
 async def stop_background_tasks() -> None:
-    for task in (pan115_recycle_cleanup_task, telegram_callback_polling_task, library_enrich_task):
+    for task in (pan115_recycle_cleanup_task, telegram_callback_polling_task, library_enrich_task, tg115_monitor_task):
         if not task or task.done():
             continue
         task.cancel()
@@ -284,7 +401,7 @@ async def telegram_callback_polling_loop() -> None:
     """
     active_token = ""
     offset: Optional[int] = None
-    async with httpx.AsyncClient(timeout=35.0) as client:
+    async with httpx.AsyncClient(timeout=35.0, proxy=httpx_proxy("tg")) as client:
         while True:
             try:
                 config = store.read_submission_config()
@@ -635,7 +752,7 @@ async def download_telegram_document_text(bot_token: str, document: Dict[str, An
     file_size = safe_int(document.get("file_size"))
     if file_size > FASTLINK_DOCUMENT_MAX_BYTES:
         raise ValueError("文件超过 20MB，请先拆分秒传 JSON")
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=60.0, proxy=httpx_proxy("tg")) as client:
         info_response = await client.get(
             f"https://api.telegram.org/bot{bot_token}/getFile",
             params={"file_id": file_id},
@@ -938,6 +1055,77 @@ async def send_telegram_transfer_status_message(task: Dict[str, Any]) -> Optiona
     return first_ref
 
 
+async def publish_completed_transfer_fastlinks(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Publish one verified single-file fastlink post per completed transfer file.
+
+    The existing submission pipeline supplies TMDB enrichment, routing,
+    publication history and Telegram send. Never advertise an unchecked
+    115-provided MD5 or publish a partial/failed transfer.
+    """
+    files = publishable_files(task)
+    if not files:
+        return {"warning": "没有可发布的已完成文件"}
+    config = store.read_submission_config()
+    bot_token = str(config.get("botToken") or "").strip()
+    owners = [safe_int(value) for value in config.get("channelOwnerUserIds") or []]
+    task_owner = safe_int(task.get("userId"))
+    owner_id = task_owner if task_owner and store.has_user_channel_config(task_owner) else next((value for value in owners if value > 0 and store.has_user_channel_config(value)), 0)
+    if not bot_token or not owner_id or not store.has_user_channel_config(owner_id):
+        return {"warning": "自动发布跳过：请先配置 Bot Token、频道所有者 UID 和频道路由"}
+
+    published = 0
+    failures: List[str] = []
+    client = None
+    listings: Dict[str, List[Dict[str, Any]]] = {}
+    for file in files:
+        key = f"transferAutoPublish:{task.get('id')}:{file_path(file)}:{int(file.get('size') or 0)}"
+        if store.read_value(key):
+            continue
+        draft_id = uuid.uuid5(uuid.NAMESPACE_URL, key).hex
+        if any(str(item.get("id") or "") == draft_id for item in list_submission_drafts(store, 200)):
+            failures.append(f"{file.get('name') or '文件'}：已有待处理投稿草稿，跳过重复发送")
+            continue
+        name = str(file.get("name") or "")
+        size = int(file.get("size") or 0)
+        try:
+            if client is None:
+                client = await transfer_service.create_status_pan123_client()
+            parent_id = str(file.get("targetDirId") or "")
+            if not parent_id or size <= 0:
+                raise ValueError("缺少 123 目标目录或文件大小")
+            if parent_id not in listings:
+                listings[parent_id] = await client.list_files(parent_id)
+            listed = listings[parent_id]
+            exact = next((item for item in listed if item.get("name") == name and int(item.get("size") or 0) == size and str(item.get("fileId") or "") == str(file.get("pan123FileId") or "")), None)
+            if not exact:
+                raise ValueError("123 目标文件未找到，未生成秒传链接")
+            etag = str(exact.get("etag") or "")
+            if not MD5_RE.fullmatch(etag):
+                raise ValueError("123 文件未返回有效 MD5，未生成秒传链接")
+            fastlink = file_fastlink(file, etag)
+            inspection = {"title": name, "fileNames": [name], "size": submission_format_size(size), "rawText": name}
+            link = {"provider": "123fastlink", "url": fastlink, "cleanUrl": fastlink, "title": name, "sourceText": name, "inspection": inspection}
+            draft = await build_submission_draft(config, link, inspection, "115 搬运自动发布", owner_chat_id=owner_id, owner_user_id=owner_id, store=store)
+            channel, _ = route_submission_draft(store, owner_id, draft)
+            if not channel or not str(channel.get("chatId") or "").strip():
+                raise ValueError("频道路由未匹配，未发布")
+            # A single-file link is safe to include in the caption. Preserve the
+            # structured share as fastlink for routing, but do not attach files.
+            draft["autoPublishCaption"] = render_reference_caption(draft, name, submission_format_size(size), fastlink)
+            draft["id"] = draft_id
+            saved = append_submission_draft(store, draft)
+            result = await publish_submission_draft(store, bot_token, config, saved, acting_user_id=owner_id)
+            if not result.get("ok"):
+                raise ValueError(f"频道发布失败：{result.get('reason') or '未知原因'}")
+            store.write_value(key, {"channelId": result.get("channelId"), "messageId": result.get("messageId")})
+            published += 1
+        except Exception as error:
+            failures.append(f"{name}：{error}")
+    if failures:
+        return {"warning": f"自动发布 {published}/{len(files)} 条；失败示例：{failures[0][:160]}"}
+    return {"published": published}
+
+
 async def cleanup_telegram_transfer_messages(payload: Dict[str, Any]) -> None:
     """搬运结束后删除 Telegram 里的排队/进度消息和用户的链接消息。"""
     task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
@@ -1167,6 +1355,10 @@ class Pan123OauthImportRequest(BaseModel):
     refreshToken: str = Field(..., min_length=1)
 
 
+class Pan123AccessTokenImportRequest(BaseModel):
+    accessToken: str = Field(..., min_length=1)
+
+
 class SessionResponse(BaseModel):
     backend: bool = True
     authenticated: bool
@@ -1174,6 +1366,8 @@ class SessionResponse(BaseModel):
     updatedAt: str = ""
     profile: Optional[Dict[str, Any]] = None
     loginExpired: bool = False
+    accessOnly: bool = False
+    expiresAt: Optional[float] = None
 
 
 class SubmissionLinkItem(BaseModel):
@@ -1272,6 +1466,10 @@ class TransferConfigRequest(BaseModel):
     excludeSuffix: str = ""
     excludeCid: str = ""
     delete115AfterSuccess: bool = False
+    autoPublishFastlink: bool = False
+    tg115MonitorEnabled: bool = False
+    tg115MonitorChannel: str = ""
+    tg115MonitorTargetDirId: str = "0"
     concurrency: int = 5
     pauseEnabled: bool = True
     pauseTimeZone: str = "Asia/Shanghai"
@@ -1367,6 +1565,9 @@ async def start_pan123_oauth() -> Pan123OauthStartResponse:
         info = await _pan123_oauth_broker().authorize_url()
     except Pan123Error as error:
         raise HTTPException(status_code=502, detail=str(error))
+    except httpx.HTTPError as error:
+        logger.warning("123 授权地址获取失败：%s", error)
+        raise HTTPException(status_code=502, detail="无法连接 123 授权服务，请检查容器网络或稍后重试") from error
     nonce = uuid.uuid4().hex
     store.write_value(PAN123_OAUTH_PENDING_KEY, {
         "nonce": nonce,
@@ -1382,6 +1583,7 @@ async def start_pan123_oauth() -> Pan123OauthStartResponse:
 
 async def _finish_pan123_authorization(refresh_token: str, access_token: str, expires_in: Optional[int]) -> Dict[str, Any]:
     """持久化 token 并抓取账号资料（昵称/UID），返回会话负载。"""
+    await transfer_service.reset_pan123_authorization()
     store.merge_session({
         "refreshToken": refresh_token,
         "accessToken": access_token,
@@ -1441,6 +1643,8 @@ async def finish_pan123_oauth(request: Pan123OauthFinishRequest) -> SessionRespo
 @app.post("/api/123/oauth/import", response_model=SessionResponse)
 async def import_pan123_refresh_token(request: Pan123OauthImportRequest) -> SessionResponse:
     """手动导入刷新令牌（浏览器模式下从 token 工具页复制）。"""
+    if pan123_open_jwt_exp(request.refreshToken.strip()) is not None:
+        raise HTTPException(status_code=400, detail="这是访问令牌，不是刷新令牌；请使用访问令牌导入入口，或粘贴完整授权回调地址")
     try:
         result = await _pan123_oauth_broker().refresh(request.refreshToken.strip())
         payload = await _finish_pan123_authorization(
@@ -1453,8 +1657,46 @@ async def import_pan123_refresh_token(request: Pan123OauthImportRequest) -> Sess
     return SessionResponse(**payload)
 
 
+@app.post("/api/123/oauth/import-access", response_model=SessionResponse)
+async def import_pan123_access_token(request: Pan123AccessTokenImportRequest) -> SessionResponse:
+    """Validate a short-lived access token directly with 123 OpenAPI before storing it."""
+    token = request.accessToken.strip()
+    expires_at = pan123_open_jwt_exp(token)
+    if expires_at is None or expires_at <= time.time() + 60:
+        raise HTTPException(status_code=400, detail="访问令牌格式无效或即将过期，请重新授权")
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(
+                "https://open-api.123pan.com/api/v1/user/info",
+                headers={"Authorization": "Bearer " + token, "platform": "open_platform"},
+            )
+        data = response.json()
+        if response.status_code != 200 or not isinstance(data, dict) or data.get("code") not in (0, 200, "0", None):
+            raise ValueError("令牌验证未通过")
+        info = data.get("data") if isinstance(data.get("data"), dict) else {}
+        if not info or not any(info.get(key) for key in ("uid", "UID", "userId", "userID")):
+            raise ValueError("123 未返回账号资料")
+    except (httpx.HTTPError, ValueError) as error:
+        raise HTTPException(status_code=400, detail="访问令牌验证失败，请检查令牌或容器网络") from error
+    from .pan123 import normalize_open_user_info
+    profile = normalize_open_user_info(info)
+    profile["fetchedAt"] = time.time()
+    store.write_session({
+        "refreshToken": "",
+        "accessToken": token,
+        "expiresAt": expires_at,
+        "loginExpired": False,
+        "user": str(profile.get("nickname") or "123 账号"),
+        "profile": profile,
+        "updatedAt": utc_now_iso(),
+    })
+    await transfer_service.reset_pan123_authorization()
+    return SessionResponse(**(await session_payload()))
+
+
 @app.post("/api/123/logout")
 async def logout_pan123() -> Dict[str, bool]:
+    await transfer_service.reset_pan123_authorization()
     store.clear_session()
     store.delete_value(PAN123_OAUTH_PENDING_KEY)
     return {"ok": True}
@@ -1598,7 +1840,7 @@ async def test_submission_bot(request: BotTestRequest) -> Dict[str, Any]:
     token = str(request.token or "").strip()
     if not token:
         raise HTTPException(status_code=400, detail="请输入 Bot Token")
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=20.0, proxy=httpx_proxy("tg")) as client:
         response = await client.get(f"https://api.telegram.org/bot{token}/getMe")
     data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
     if response.status_code >= 400 or not data.get("ok", True):
@@ -1983,11 +2225,28 @@ async def read_transfer_config() -> Dict[str, Any]:
 
 @app.put("/api/transfer/config")
 async def write_transfer_config(config: TransferConfigRequest) -> Dict[str, Any]:
+    if config.tg115MonitorEnabled:
+        try:
+            normalize_tg115_channel(config.tg115MonitorChannel)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        if not config.enabled:
+            raise HTTPException(status_code=400, detail="请先启用 115 搬运，再开启 TG 频道监控")
+        if not re.fullmatch(r"[0-9]+", config.tg115MonitorTargetDirId.strip()):
+            raise HTTPException(status_code=400, detail="监控的 123 目标目录 ID 必须是数字")
     payload = normalize_transfer_config(config.dict())
     saved = store.write_config({"transfer": payload})
     transfer_service._remember_config(saved.get("transfer") if isinstance(saved.get("transfer"), dict) else {})
     transfer_service.kick()
     return {"ok": True, "config": normalize_transfer_config(saved)}
+
+
+@app.get("/api/transfer/tg115-monitor/status")
+async def read_tg115_monitor_status() -> Dict[str, Any]:
+    config = normalize_transfer_config(store.read_config())
+    raw = store.read_value(TG115_MONITOR_STATUS_KEY)
+    status = raw if isinstance(raw, dict) else {}
+    return {"ok": True, "enabled": config["tg115MonitorEnabled"], "channel": config["tg115MonitorChannel"], "status": status}
 
 
 @app.get("/api/transfer/tasks")
@@ -2649,6 +2908,34 @@ async def import_library_fastlink(request: LibraryImportFastlinkRequest, request
 TMDB_BUILTIN_KEY = "8265bd1679663a7ea12ac168da84d2e8"
 
 
+def _tmdb_image_url(size: str, path: str) -> str:
+    if not path:
+        return ""
+    return f"https://image.tmdb.org/t/p/{size}/{path.lstrip('/')}"
+
+
+def _web_tmdb_image_url(url: str) -> str:
+    if not web_auth.enabled():
+        return url
+    match = re.fullmatch(r"https://image\.tmdb\.org/t/p/(w185|w342|w500|w780|w1280)/([A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp))", url)
+    return f"/api/library/tmdb-image/{match.group(1)}/{match.group(2)}" if match else url
+
+
+@app.get("/api/library/tmdb-image/{size}/{filename}")
+async def library_tmdb_image(size: str, filename: str):
+    """Serve TMDB images through the configured backend proxy in web mode."""
+    filename = url_unquote(filename)
+    if size not in {"w185", "w342", "w500", "w780", "w1280"} or not re.fullmatch(r"[A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp)", filename):
+        raise HTTPException(status_code=404)
+    try:
+        response = await _tmdb_http().get(f"https://image.tmdb.org/t/p/{size}/{filename}")
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="TMDB 图片代理连接失败")
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="TMDB 图片获取失败")
+    return Response(content=response.content, media_type=response.headers.get("content-type", "image/jpeg"), headers={"Cache-Control": "public, max-age=86400"})
+
+
 def _tmdb_credentials() -> Tuple[str, str]:
     submission = store.read_submission_config()
     token = str(submission.get("tmdbToken") or "").strip()
@@ -2663,7 +2950,7 @@ def _tmdb_http() -> httpx.AsyncClient:
     """整理循环专用的共享连接池：每个作品 1-2 次 TMDB 请求，复用省掉反复建连的开销。"""
     global _tmdb_http_client
     if _tmdb_http_client is None or _tmdb_http_client.is_closed:
-        _tmdb_http_client = httpx.AsyncClient(timeout=15.0)
+        _tmdb_http_client = httpx.AsyncClient(timeout=15.0, proxy=httpx_proxy("tmdb"))
     return _tmdb_http_client
 
 
@@ -2720,14 +3007,14 @@ async def library_poster(
     cache_key = f"moviePoster:{tmdbId}"
     cached = store.read_value(cache_key)
     if isinstance(cached, dict) and "url" in cached:
-        return {"ok": True, "url": str(cached.get("url") or "")}
+        return {"ok": True, "url": _web_tmdb_image_url(str(cached.get("url") or ""))}
     verified = unverified = ""
     for type_ in ("movie", "tv"):
         info = await _tmdb_fetch_info(type_, tmdbId)
         if not info:
             continue
         score = _tmdb_match_score(info, title, year)
-        poster = f"https://image.tmdb.org/t/p/w185{info['poster_path']}" if info.get("poster_path") else ""
+        poster = _tmdb_image_url("w185", info.get("poster_path") or "")
         if poster and score >= 1 and not verified:
             verified = poster
         if poster and not unverified:
@@ -2735,7 +3022,7 @@ async def library_poster(
     url = verified or unverified
     if url:
         store.write_value(cache_key, {"url": url})
-    return {"ok": True, "url": url}
+    return {"ok": True, "url": _web_tmdb_image_url(url)}
 
 
 @app.get("/api/library/tmdb/{tmdb_id}")
@@ -2768,7 +3055,7 @@ async def library_tmdb_detail(
             "overview": str(info.get("overview") or ""),
             "voteAverage": float(info.get("vote_average") or 0),
             "genres": [str(g.get("name") or "") for g in (info.get("genres") or []) if isinstance(g, dict)],
-            "posterUrl": f"https://image.tmdb.org/t/p/w185{info['poster_path']}" if info.get("poster_path") else "",
+            "posterUrl": _tmdb_image_url("w185", info.get("poster_path") or ""),
         }
     if best is not None:
         store.write_value(cache_key, best)
@@ -2788,7 +3075,7 @@ async def _tmdb_fetch_season(tmdb_id: int, season: int) -> Optional[Dict[str, An
         f"https://api.tmdb.org/3/tv/{tmdb_id}/season/{season}?api_key={TMDB_BUILTIN_KEY}&language=zh-CN",
         {},
     ))
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, proxy=httpx_proxy("tmdb")) as client:
         for url, headers in attempts:
             try:
                 resp = await client.get(url, headers=headers)
@@ -2819,7 +3106,7 @@ async def library_tmdb_season(
     normalized = {
         "seasonNumber": int(info.get("season_number") or season),
         "name": str(info.get("name") or f"第 {season} 季"),
-        "posterUrl": f"https://image.tmdb.org/t/p/w342{info['poster_path']}" if info.get("poster_path") else "",
+        "posterUrl": _tmdb_image_url("w342", info.get("poster_path") or ""),
         "episodes": [
             {
                 "episode": int(e.get("episode_number") or 0),
@@ -2839,7 +3126,7 @@ def _tmdb_enrich_fields(info: Dict[str, Any], matched_type: str) -> Dict[str, An
     """把 TMDB info 归一成入库分类字段（genres 中文名列表、region 中文桶、海报 URL、评分、简介、年份）。"""
     genres = [str(g.get("name") or "") for g in (info.get("genres") or []) if isinstance(g, dict) and g.get("name")]
     date = str(info.get("release_date") or info.get("first_air_date") or "")
-    poster = f"https://image.tmdb.org/t/p/w185{info['poster_path']}" if info.get("poster_path") else ""
+    poster = _tmdb_image_url("w185", info.get("poster_path") or "")
     return {
         # media_type 存中文频道（电影/电视剧/纪录片/综艺/动漫/儿童），不再存 movie/tv
         "media_type": movie_library.normalize_channel(matched_type, info),
@@ -3097,7 +3384,7 @@ async def _tmdb_identify_candidates(query: str, year: int) -> List[Dict[str, Any
                         "title": str(item.get("title") or item.get("name") or ""),
                         "originalTitle": str(item.get("original_title") or item.get("original_name") or ""),
                         "year": int(date[:4]) if date[:4].isdigit() else 0,
-                        "poster": f"https://image.tmdb.org/t/p/w185{item['poster_path']}" if item.get("poster_path") else "",
+                        "poster": _tmdb_image_url("w185", item.get("poster_path") or ""),
                         "popularity": float(item.get("popularity") or 0),
                         "score": _tmdb_match_score(item, query, year),
                     })
@@ -3854,16 +4141,18 @@ def _looks_like_login_expired(message: str) -> bool:
 
 
 async def session_payload(refresh_profile: bool = False) -> Dict[str, Any]:
-    """123 授权会话状态：refresh token 在即视为已授权，资料用 OpenAPI 抓取并缓存。"""
+    """123 授权会话状态：完整授权或未过期的访问令牌均可用。"""
     session = store.read_session()
-    if not session or not session.get("refreshToken"):
+    if not session or (not session.get("refreshToken") and not session.get("accessToken")):
         return {"backend": True, "authenticated": False, "user": "", "updatedAt": "", "profile": None, "loginExpired": False}
+    access_only = not session.get("refreshToken")
+    access_expired = access_only and float(session.get("expiresAt") or 0) <= time.time() + 60
     profile = session.get("profile")
-    login_expired = bool(session.get("loginExpired"))
+    login_expired = bool(session.get("loginExpired")) or access_expired
     fetched_at = profile.get("fetchedAt") if isinstance(profile, dict) and isinstance(profile.get("fetchedAt"), (int, float)) else 0.0
     if not isinstance(profile, dict) or not profile or (refresh_profile and time.time() - float(fetched_at) > PROFILE_TTL_SECONDS):
-        fresh = await load_open_profile()
-        if fresh.get("uid"):
+        fresh = await load_open_profile() if not access_expired else {"uid": None, "fetchError": "访问令牌已过期"}
+        if fresh.get("uid") and not access_expired:
             fresh["fetchedAt"] = time.time()
             profile = fresh
             login_expired = False
@@ -3874,7 +4163,7 @@ async def session_payload(refresh_profile: bool = False) -> Dict[str, Any]:
             store.merge_session({"profile": None, "loginExpired": True})
         else:
             # 刷新失败（多为授权失效）：保留旧缓存，把状态暴露给前端提示重新授权
-            login_expired = _looks_like_login_expired(str(fresh.get("fetchError") or ""))
+            login_expired = access_expired or _looks_like_login_expired(str(fresh.get("fetchError") or ""))
             store.merge_session({"loginExpired": login_expired})
     return {
         "backend": True,
@@ -3883,6 +4172,8 @@ async def session_payload(refresh_profile: bool = False) -> Dict[str, Any]:
         "updatedAt": str(session.get("updatedAt") or ""),
         "profile": profile if isinstance(profile, dict) else None,
         "loginExpired": login_expired,
+        "accessOnly": access_only,
+        "expiresAt": float(session.get("expiresAt") or 0) if access_only else None,
     }
 
 
@@ -3915,7 +4206,7 @@ async def load_open_profile() -> Dict[str, Any]:
 async def current_pan123_uid() -> int:
     """当前授权账号的 123 UID（分享归属判断用）；未授权或资料抓取失败返回 0。"""
     session = store.read_session()
-    if not session or not session.get("refreshToken"):
+    if not session or (not session.get("refreshToken") and not session.get("accessToken")):
         return 0
     profile = session.get("profile") if isinstance(session.get("profile"), dict) else {}
     uid = safe_int(profile.get("uid"))
@@ -3949,6 +4240,10 @@ def normalize_transfer_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "excludeSuffix": str(raw.get("excludeSuffix") or raw.get("exclude_suffix") or "").strip(),
         "excludeCid": str(raw.get("excludeCid") or raw.get("exclude_cid") or "").strip(),
         "delete115AfterSuccess": bool(raw.get("delete115AfterSuccess") or raw.get("delete_115")),
+        "autoPublishFastlink": raw.get("autoPublishFastlink") is True,
+        "tg115MonitorEnabled": raw.get("tg115MonitorEnabled") is True,
+        "tg115MonitorChannel": str(raw.get("tg115MonitorChannel") or "").strip(),
+        "tg115MonitorTargetDirId": str(raw.get("tg115MonitorTargetDirId") or "0").strip() or "0",
         "concurrency": clamp_int(raw.get("concurrency"), 1, 5, 5),
         "pauseEnabled": raw.get("pauseEnabled") is not False,
         "pauseTimeZone": str(raw.get("pauseTimeZone") or "Asia/Shanghai").strip() or "Asia/Shanghai",

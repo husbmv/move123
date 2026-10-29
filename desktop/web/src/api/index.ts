@@ -53,6 +53,10 @@ export const adminApi = {
       "/api/123/oauth/import",
       { refreshToken }
     ),
+  oauthImportAccess: (accessToken: string) =>
+    api.post<{ authenticated: boolean; user: string; accessOnly?: boolean; expiresAt?: number }>(
+      "/api/123/oauth/import-access", { accessToken }
+    ),
   logout: () => api.post<{ ok: boolean }>("/api/123/logout"),
 };
 
@@ -131,6 +135,7 @@ export const pan115HelperApi = {
 export const transferApi = {
   getConfig: () => api.get<TransferConfig>("/api/transfer/config"),
   putConfig: (config: TransferConfig) => api.put<{ ok: boolean; config: TransferConfig }>("/api/transfer/config", config),
+  tg115MonitorStatus: () => api.get<{ ok: boolean; enabled: boolean; channel: string; status: { state?: string; cursor?: number; lastError?: string; lastCheckedAt?: string; accepted?: number; messages?: number } }>("/api/transfer/tg115-monitor/status"),
   tasks: (limit = 100) => api.get<TransferTask[]>(`/api/transfer/tasks?limit=${limit}`),
   submit: (text: string) => api.post<{ ok: boolean; tasks: TransferTask[] }>("/api/transfer/tasks", { text }),
   submitLocal: (path115: string) => api.post<{ ok: boolean; task: TransferTask }>("/api/transfer/local-tasks", { path115 }),

@@ -18,6 +18,32 @@ from app.transfer_service import TransferService
 
 
 class TransferServiceTests(unittest.TestCase):
+    def test_monitor_task_snapshots_its_own_target_and_rotates_cookie_pool(self):
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                store = SessionStore(Path(directory))
+                store.write_config({"transfer": {
+                    "enabled": True, "targetDirId": "11", "pauseEnabled": False,
+                    "pan115Cookie": "a|UID=1; CID=1; SEID=a" + chr(10) + "b|UID=2; CID=2; SEID=b",
+                }})
+                service = TransferService(store)
+                service._notify_queued_tasks = AsyncMock()  # type: ignore[method-assign]
+                service.kick = lambda: None  # type: ignore[method-assign]
+                tasks = await service.enqueue_from_text(
+                    "https://115cdn.com/s/abcd?password=1234", "tg115-monitor:@channel", target_dir_id="99"
+                )
+                self.assertEqual(tasks[0]["targetDirId"], "99")
+                self.assertEqual(store.get_transfer_task(tasks[0]["id"])["targetDirId"], "99")
+                pipeline = TransferPipeline(service, tasks[0], store.read_config()["transfer"])
+                self.assertEqual(pipeline.target_root_id, "99")
+                accounts = service._accounts_for_task(store.read_config()["transfer"], tasks[0])
+                self.assertEqual({a["name"] for a in accounts}, {"a", "b"})
+                self.assertEqual(accounts, service._accounts_for_task(store.read_config()["transfer"], tasks[0]))
+                regular = await service.enqueue_from_text("https://115cdn.com/s/efgh?password=5678", "admin")
+                self.assertEqual(regular[0]["targetDirId"], "11")
+                await service.close()
+        asyncio.run(run())
+
     def test_pan123_share_copy_scheduler_runs_only_one_copy_task(self):
         async def run() -> None:
             with tempfile.TemporaryDirectory() as directory:

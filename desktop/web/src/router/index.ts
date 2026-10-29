@@ -2,6 +2,12 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router"
 
 const routes: RouteRecordRaw[] = [
   {
+    path: "/admin/login",
+    name: "login",
+    component: () => import("@/views/LoginView.vue"),
+    meta: { public: true, title: "登录" },
+  },
+  {
     path: "",
     redirect: "/admin/console",
   },
@@ -42,6 +48,13 @@ const routes: RouteRecordRaw[] = [
     component: () => import("@/views/Pan115HubView.vue"),
     props: { initialTab: "transfer" },
     meta: { title: "115 搬运", desc: "115 分享搬运到 123 云盘，支持 Cookie 池、秒传和离线兜底。", icon: "mdi-cloud-sync" },
+  },
+  {
+    path: "/admin/tg115-monitor",
+    name: "tg115-monitor",
+    component: () => import("@/views/Pan115HubView.vue"),
+    props: { initialTab: "monitor" },
+    meta: { title: "TG 频道监控", desc: "监控频道中的 115 分享并搬运到指定 123 文件夹。", icon: "mdi-telegram" },
   },
   {
     path: "/admin/pan115-helper",
@@ -85,4 +98,16 @@ export const router = createRouter({
   scrollBehavior() {
     return { top: 0, behavior: "smooth" };
   },
+});
+
+router.beforeEach(async (to) => {
+  if (to.path === "/admin/login") return true;
+  try {
+    const response = await fetch("/api/web-auth/state", { cache: "no-store" });
+    const state = await response.json() as { enabled: boolean; authenticated: boolean };
+    if (state.enabled && !state.authenticated) {
+      return { path: "/admin/login", query: { next: to.fullPath } };
+    }
+  } catch { /* Desktop and older backends remain usable. */ }
+  return true;
 });

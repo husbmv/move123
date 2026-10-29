@@ -1,5 +1,9 @@
 # 123Cloud
 
+> Docker 网页版（端口 12315、后台登录、TG/TMDB 代理）的[详细使用手册](DOCKER_GUIDE.md)和[快速部署说明](DOCKER.md)。此仓库的 Docker 变体不启动 Electron。
+
+> 本仓库是基于 [weige146/123Cloud](https://github.com/weige146/123Cloud) 的个人 Docker 网页版改造，原项目版权与许可证归原作者所有；新增 Docker、网页登录、频道监控等改动见本仓库文档。
+
 [![CI](https://github.com/weige146/123Cloud/actions/workflows/ci.yml/badge.svg)](https://github.com/weige146/123Cloud/actions/workflows/ci.yml)
 
 123Cloud 是一个跑在自己电脑上的**网盘资源投稿 / 搬运工具箱**（Windows / macOS 桌面应用，Electron 壳 + Python 后端 + 液态玻璃 UI）。它把「115 网盘 → 123 云盘」的搬运、资源投稿的整理与频道发布、123 云盘网页端的增强操作收进一个客户端。

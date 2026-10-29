@@ -269,6 +269,21 @@ class Pan123OpenAPIClientTests(unittest.TestCase):
         with self.assertRaises(Pan123Error):
             asyncio.run(client.get_token())
 
+    def test_access_only_token_works_until_expiry_without_refresh(self):
+        token = _jwt(int(time.time()) + 3600)
+        store = InMemoryOauthStore({"refreshToken": "", "accessToken": token, "expiresAt": time.time() + 3600})
+        client = Pan123OpenAPIClient(broker=Pan123OauthBroker(), oauth_store=store)
+        client.broker.refresh = AsyncMock(side_effect=AssertionError("must not refresh"))
+        assert asyncio.run(client.get_token()) == token
+        assert client.authorized
+        client.broker.refresh.assert_not_awaited()
+
+        expired = Pan123OpenAPIClient(broker=Pan123OauthBroker(), oauth_store=InMemoryOauthStore({
+            "refreshToken": "", "accessToken": token, "expiresAt": time.time() - 1,
+        }))
+        with self.assertRaisesRegex(Pan123Error, "访问令牌已过期"):
+            asyncio.run(expired.get_token())
+
     def test_request_refreshes_once_after_401(self):
         expires_at = int(time.time()) + 7 * 86400
         old_token = _jwt(int(time.time()) + 86400, "old")

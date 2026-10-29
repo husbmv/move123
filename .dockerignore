@@ -1,0 +1,10 @@
+.git
+data
+desktop/web/node_modules
+desktop/web/dist
+desktop/backend/.venv
+desktop/backend/data
+desktop/backend/tests
+desktop/release
+desktop/backend-build
+desktop/backend-dist

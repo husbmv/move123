@@ -874,7 +874,7 @@ class TransferPipeline:
         self.config = transfer_config
         self.dir_cache = TransferDirCache()
         self.pan123: Pan123OpenAPIClient = None  # type: ignore[assignment]
-        self.target_root_id = str(transfer_config.get("targetDirId") or "0").strip() or "0"
+        self.target_root_id = str(task.get("targetDirId") or transfer_config.get("targetDirId") or "0").strip() or "0"
         # 同时在 123 排队的离线任务上限 = 后台"并发"配置（1-5）
         self.offline = OfflineDownloadManager(self, service._max_offline_slots(transfer_config))
         self.started_ms = time.monotonic() * 1000
@@ -939,6 +939,10 @@ class TransferPipeline:
                 "receive_code": task.get("receiveCode"),
             }
             accounts = self.service._filter_live_accounts(_transfer_cookie_pool(transfer_config), task)
+            if str(task.get("source") or "").startswith("tg115-monitor:") and len(accounts) > 1:
+                import hashlib
+                offset = int(hashlib.sha256(str(task.get("shareCode") or "").encode()).hexdigest(), 16) % len(accounts)
+                accounts = accounts[offset:] + accounts[:offset]
             inspected = await self.service._inspect_pan115_share(task, link, accounts, transfer_config.get("pan115Cookie", ""))
             inspection = inspected["inspection"]
             task["title"] = inspection.get("title") or task.get("title")
@@ -1214,6 +1218,10 @@ class TransferPipeline:
         if not offline_files:
             return
         accounts = self.service._filter_live_accounts(_transfer_cookie_pool(self.config))
+        if str(self.task.get("source") or "").startswith("tg115-monitor:") and len(accounts) > 1:
+            import hashlib
+            offset = int(hashlib.sha256(str(self.task.get("shareCode") or "").encode()).hexdigest(), 16) % len(accounts)
+            accounts = accounts[offset:] + accounts[:offset]
         # 本地盘文件只存在于助手账号里，取直链不换号；分享任务轮询账号池
         fixed_account: Optional[Dict[str, str]] = None
         if _is_local_115_task(self.task):

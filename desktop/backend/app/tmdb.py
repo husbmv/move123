@@ -13,6 +13,7 @@ from datetime import date
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
+from .network_proxy import httpx_proxy
 
 YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d|p)", re.I)
 
@@ -414,7 +415,7 @@ async def _load_tmdb_search_candidates(
         [(media_type, f"/search/{media_type}")] if media_type in {"movie", "tv"} else [(None, "/search/multi")]
     )
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=20.0, proxy=httpx_proxy("tmdb")) as client:
         for candidate_query in build_tmdb_search_queries(query):
             for endpoint_type, path in endpoints:
                 params: Dict[str, Any] = {
@@ -523,7 +524,7 @@ async def tmdb_request_json(token: str, path: str, params: Optional[Dict[str, An
             if client is not None:
                 response = await client.get(url, headers=headers, params=query)
             else:
-                async with httpx.AsyncClient(timeout=20.0) as own_client:
+                async with httpx.AsyncClient(timeout=20.0, proxy=httpx_proxy("tmdb")) as own_client:
                     response = await own_client.get(url, headers=headers, params=query)
             if response.status_code == 429 or response.status_code >= 500:
                 raise ValueError(f"TMDB {response.status_code}: {response.text[:300]}")

@@ -132,6 +132,7 @@ class TransferService:
         self._queued_notifier: Optional[TransferQueuedNotifier] = None
         self._cookie_notifier: Optional[TransferCookieNotifier] = None
         self._cleanup_notifier: Optional[TransferCleanupNotifier] = None
+        self._publish_notifier: Optional[TransferNotifier] = None
         self._pan115_download_queue: Optional[asyncio.Future[Any]] = None
         self._last_pan115_download_at = 0.0
         self._cached_transfer_config: Optional[Dict[str, Any]] = None
@@ -207,6 +208,10 @@ class TransferService:
         """搬运终态（成功/失败/部分失败）通知。"""
         self._notifier = notifier
 
+    def set_publish_notifier(self, notifier: Optional[TransferNotifier]) -> None:
+        """Successful 115 → 123 tasks may publish verified files to routed TG channels."""
+        self._publish_notifier = notifier
+
     def set_queued_notifier(self, notifier: Optional[TransferQueuedNotifier]) -> None:
         """任务入队通知。"""
         self._queued_notifier = notifier
@@ -235,6 +240,17 @@ class TransferService:
             if client is not None:
                 await client.close()
         await self._pan123_share_client.close()
+
+    async def reset_pan123_authorization(self) -> None:
+        """Drop the cached OpenAPI client after an OAuth account/token change."""
+        if self._pan123_open_client_lock is None:
+            self._pan123_open_client_lock = asyncio.Lock()
+        async with self._pan123_open_client_lock:
+            client = self._pan123_open_client
+            self._pan123_open_client = None
+            self._pan123_open_client_key = ""
+            if client is not None:
+                await client.close()
 
     async def requeue_task(self, task_id: str) -> Dict[str, Any]:
         task = self._store.get_transfer_task(task_id)
@@ -297,11 +313,14 @@ class TransferService:
         chat_id: Optional[int] = None,
         user_id: Optional[int] = None,
         message_id: Optional[int] = None,
+        target_dir_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         config = self._store.read_config()
         self._remember_config(config.get("transfer"))
         if not config.get("transfer", {}).get("enabled"):
             raise RuntimeError("115 搬运未启用，请先在后台开启")
+        if target_dir_id is not None and not re.fullmatch(r"[0-9]+", str(target_dir_id)):
+            raise ValueError("123 目标目录 ID 必须是数字")
 
         links = _unique_115_links(extract_115_links(text))
         if not links:
@@ -323,6 +342,7 @@ class TransferService:
                 "chatId": chat_id,
                 "userId": user_id,
                 "messageId": message_id,
+                "targetDirId": str(target_dir_id) if target_dir_id is not None else str(config.get("transfer", {}).get("targetDirId") or "0"),
                 "shareUrl": link["clean_url"],
                 "shareCode": link["share_code"],
                 "receiveCode": link.get("receive_code"),
@@ -472,7 +492,7 @@ class TransferService:
         if not re.fullmatch(r"\d+", normalized_dir):
             raise RuntimeError("123 源目录 ID 必须是数字（根目录填 0）")
         session = self._store.read_session()
-        if not session or not session.get("refreshToken"):
+        if not session or (not session.get("refreshToken") and not session.get("accessToken")):
             raise RuntimeError("123 云盘尚未授权登录，请先到设置页完成 123 账号授权")
         submission = self._store.read_submission_config()
         helper = submission.get("pan115Helper") if isinstance(submission.get("pan115Helper"), dict) else {}
@@ -537,7 +557,7 @@ class TransferService:
             raise RuntimeError("115 搬运未启用，请先在后台开启")
 
         session = self._store.read_session()
-        if not session or not session.get("refreshToken"):
+        if not session or (not session.get("refreshToken") and not session.get("accessToken")):
             raise RuntimeError("123 云盘尚未授权登录，请先到设置页完成 123 账号授权")
 
         parsed = parse_pan123_share_url(share_url)
@@ -688,6 +708,13 @@ class TransferService:
             return list(accounts)
         return live if live else list(accounts)
 
+    def _accounts_for_task(self, config: Dict[str, Any], task: Dict[str, Any]) -> List[Dict[str, str]]:
+        accounts = self._filter_live_accounts(_transfer_cookie_pool(config), task)
+        if str(task.get("source") or "").startswith("tg115-monitor:") and len(accounts) > 1:
+            offset = int(hashlib.sha256(str(task.get("shareCode") or "").encode()).hexdigest(), 16) % len(accounts)
+            return accounts[offset:] + accounts[:offset]
+        return accounts
+
     async def _mark_account_cooling(self, task: Optional[Dict[str, Any]], account: Dict[str, str], reason: str) -> bool:
         """标记账号进入冷却；返回是否为本次周期首次标记（用于通知去重）。"""
         fingerprint = self._account_fingerprint(account.get("cookie", ""))
@@ -740,7 +767,7 @@ class TransferService:
         self._account_health.clear()
         return sorted(names)
 
-    def _download_url_candidates(self, primary: Optional[Dict[str, str]], allow_rotation: bool) -> List[Dict[str, str]]:
+    def _download_url_candidates(self, primary: Optional[Dict[str, str]], allow_rotation: bool, task: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
         """取直链候选账号：主账号优先，其余活账号按池顺序兜底（仅分享任务允许换号）。"""
         candidates: List[Dict[str, str]] = []
         if primary and primary.get("cookie"):
@@ -748,6 +775,9 @@ class TransferService:
         if allow_rotation:
             try:
                 pool = self._filter_live_accounts(_transfer_cookie_pool(self._cached_transfer_config or {}))
+                if task and str(task.get("source") or "").startswith("tg115-monitor:") and len(pool) > 1:
+                    offset = int(hashlib.sha256(str(task.get("shareCode") or "").encode()).hexdigest(), 16) % len(pool)
+                    pool = pool[offset:] + pool[:offset]
             except Exception:
                 pool = []
             for account in pool:
@@ -845,8 +875,30 @@ class TransferService:
         )
         if not await self._save_transfer_task(task):
             return
+        await self._publish_completed_transfer(task, transfer_config)
         await self._notify_task(task)
         await self._discard_finished_task_record(task)
+
+    async def _publish_completed_transfer(self, task: Dict[str, Any], transfer_config: Dict[str, Any]) -> None:
+        if not transfer_config.get("autoPublishFastlink") or task.get("status") != "success" or not self._publish_notifier:
+            return
+        if str(task.get("kind") or "pan115_share") not in {"pan115_share", ""}:
+            return
+        if self._store.read_value(f"transferAutoPublishDone:{task.get('id')}"):
+            return
+        try:
+            result = await self._publish_notifier(task)
+            if isinstance(result, dict) and result.get("warning"):
+                _add_task_log(task, "warn", str(result["warning"]))
+                await self._save_transfer_task(task)
+            elif isinstance(result, dict) and result.get("published") is not None:
+                _add_task_log(task, "info", f"自动发布到频道：{int(result.get('published') or 0)} 条")
+                await self._save_transfer_task(task)
+                self._store.write_value(f"transferAutoPublishDone:{task.get('id')}", True)
+        except Exception as error:
+            _add_task_log(task, "warn", f"搬运成功，但自动发布失败：{error}")
+            await self._save_transfer_task(task)
+            logger.warning("搬运自动发布失败", extra={"task_id": task.get("id"), "error": str(error)})
 
     async def _run_pan123_share_copy(self, task: Dict[str, Any], transfer_config: Dict[str, Any]) -> None:
         """123 分享转存到自己网盘（OpenAPI 秒传通道）。
@@ -1097,7 +1149,7 @@ class TransferService:
         async def _job() -> str:
             # 本地盘文件只存在于指定账号的网盘里，不换号；分享任务可换池内其他活账号
             allow_rotation = not _is_local_115_file(file) and not _is_local_115_task(task)
-            candidates = self._download_url_candidates(pan115_account, allow_rotation)
+            candidates = self._download_url_candidates(pan115_account, allow_rotation, task)
             if not candidates:
                 return await _attempt(pan115)
             last_error = ""

@@ -1,0 +1,15 @@
+services:
+  cloud123:
+    build: .
+    container_name: cloud123
+    restart: unless-stopped
+    ports:
+      - "12315:12315"
+    environment:
+      TZ: Asia/Shanghai
+      TG_PROXY_URL: ${TG_PROXY_URL:-}
+      TMDB_PROXY_URL: ${TMDB_PROXY_URL:-}
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

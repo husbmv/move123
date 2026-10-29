@@ -5,6 +5,7 @@ import logging
 import re
 from typing import Any, Dict, Iterable, List
 from urllib.parse import parse_qs, urlparse
+from .network_proxy import telegram_telethon_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +196,8 @@ async def connect_telegram_client(config: Dict[str, Any]) -> Any:
     if api_id <= 0 or not api_hash or not session:
         raise ValueError("请先配置 TG API ID、API Hash 和用户 Session")
 
-    client = TelegramClient(StringSession(session), api_id, api_hash, connection_retries=3, retry_delay=1)
+    proxy = telegram_telethon_proxy()
+    client = TelegramClient(StringSession(session), api_id, api_hash, connection_retries=3, retry_delay=1, **({"proxy": proxy} if proxy else {}))
     try:
         await client.connect()
         if not await client.is_user_authorized():

@@ -18,6 +18,7 @@ import logging
 import re
 import time
 import uuid
+from .network_proxy import telegram_telethon_proxy
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -166,7 +167,8 @@ async def start_login(api_id: Any, api_hash: Any, phone: Any) -> Dict[str, Any]:
 
     client_class = _require_telethon()
     await _drop_expired()
-    client = client_class(StringSession(), api_id_value, api_hash_value)
+    proxy = telegram_telethon_proxy()
+    client = client_class(StringSession(), api_id_value, api_hash_value, **({"proxy": proxy} if proxy else {}))
     try:
         await client.connect()
         sent = await client.send_code_request(phone_value)

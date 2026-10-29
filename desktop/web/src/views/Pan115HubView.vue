@@ -12,7 +12,7 @@ import { formatBytes } from "@/utils/format";
 import { useGlobalState } from "@/composables/useGlobalState";
 import { useResponsive } from "@/composables/useResponsive";
 
-type HubTab = "transfer" | "helper" | "cookie" | "pool";
+type HubTab = "transfer" | "monitor" | "helper" | "cookie" | "pool";
 
 const props = withDefaults(
   defineProps<{
@@ -27,10 +27,11 @@ const { state, loadStatus, ensureSubmissionConfig, writeSubmissionConfig, notify
 const { isMobile } = useResponsive();
 
 const tab = ref<HubTab>(props.initialTab);
-const loadedTabs = reactive<Record<HubTab, boolean>>({ transfer: false, helper: false, cookie: false, pool: false });
+const loadedTabs = reactive<Record<HubTab, boolean>>({ transfer: false, monitor: false, helper: false, cookie: false, pool: false });
 
 const TAB_ROUTES: Record<HubTab, string> = {
   transfer: "/admin/transfer",
+  monitor: "/admin/tg115-monitor",
   helper: "/admin/pan115-helper",
   cookie: "/admin/pan115-cookie",
   pool: "/admin/pan115-pool",
@@ -50,6 +51,10 @@ const defaultTransferConfig: TransferConfig = {
   excludeSuffix: "",
   excludeCid: "",
   delete115AfterSuccess: false,
+  autoPublishFastlink: false,
+  tg115MonitorEnabled: false,
+  tg115MonitorChannel: "",
+  tg115MonitorTargetDirId: "0",
   concurrency: 5,
   pauseEnabled: true,
   pauseTimeZone: "Asia/Shanghai",
@@ -64,6 +69,7 @@ const defaultTransferConfig: TransferConfig = {
 };
 
 const transferForm = reactive<TransferConfig>({ ...defaultTransferConfig });
+const tg115MonitorStatus = ref("");
 const transferTasks = ref<TransferTask[]>([]);
 const offlineTasks = ref<TransferOfflineTask[]>([]);
 const offlinePanel = ref(false);
@@ -132,6 +138,10 @@ function collectTransferConfig(): TransferConfig {
     excludeSuffix: transferForm.excludeSuffix.trim(),
     excludeCid: transferForm.excludeCid.trim(),
     delete115AfterSuccess: transferForm.delete115AfterSuccess === true,
+    autoPublishFastlink: transferForm.autoPublishFastlink === true,
+    tg115MonitorEnabled: transferForm.tg115MonitorEnabled === true,
+    tg115MonitorChannel: transferForm.tg115MonitorChannel.trim(),
+    tg115MonitorTargetDirId: transferForm.tg115MonitorTargetDirId.trim() || "0",
     concurrency: clampNumber(transferForm.concurrency, 1, 5, 5),
     pauseStartHour: clampNumber(transferForm.pauseStartHour, 0, 23, 18),
     pauseEndHour: clampNumber(transferForm.pauseEndHour, 0, 23, 1),
@@ -194,6 +204,13 @@ async function loadTransfer() {
       transferApi.accountCooldowns().catch(() => ({ accounts: [], cooldownMinutes: 30 })),
     ]);
     applyTransferConfig(config);
+    try {
+      const monitor = await transferApi.tg115MonitorStatus();
+      const detail = monitor.status;
+      tg115MonitorStatus.value = monitor.enabled
+        ? (detail?.state === "error" ? "监控异常：" + (detail.lastError || "请检查 TG 用户 Session") : "监控中 · 最近消息 ID " + (detail?.cursor || 0) + " · 上次检查 " + (detail?.lastCheckedAt || "未开始"))
+        : "监控未启用";
+    } catch { tg115MonitorStatus.value = "监控状态暂不可用"; }
     transferTasks.value = list;
     coolingAccounts.value = cooldowns.accounts;
     syncSelectedTransferTask();
@@ -210,6 +227,7 @@ async function saveTransfer() {
     [transferForm.pan115TargetCid, digitsOrEmpty],
     [transferForm.excludeCid, cidListOrEmpty],
     [transferForm.pan123OauthApi, httpUrlOrEmpty],
+    [transferForm.tg115MonitorTargetDirId, digitsOrEmpty],
   ];
   for (const [value, check] of checks) {
     const result = check(value);
@@ -222,8 +240,12 @@ async function saveTransfer() {
   try {
     const data = await transferApi.putConfig(collectTransferConfig());
     applyTransferConfig(data.config);
-    notifySuccess("115 搬运配置已保存");
+    notifySuccess(tab.value === "monitor" ? "频道监控配置已保存" : "115 搬运配置已保存");
     await loadTransferTasks();
+    if (tab.value === "monitor") {
+      const monitor = await transferApi.tg115MonitorStatus();
+      tg115MonitorStatus.value = monitor.enabled ? "监控已启用，等待下一次检查" : "监控未启用";
+    }
     transferSettingsOpen.value = false;
   } catch (error) {
     notifyError(`保存失败：${error instanceof Error ? error.message : String(error)}`);
@@ -745,7 +767,8 @@ const pan123PickerDir = ref(0);
 const pan123PickerPath = ref<{ fileId: number; name: string }[]>([]);
 const pan123PickerDirs = ref<Pan123BrowseItem[]>([]);
 const pan123PickerFiles = ref<Pan123BrowseItem[]>([]);
-const pan123PickerMode = ref<"helper" | "pool">("helper");
+const pan123PickerMode = ref<"helper" | "pool" | "monitor">("helper");
+const monitorTargetPath = ref("");
 
 function pan123PickerPathText() {
   return "/" + pan123PickerPath.value.map((item) => item.name).join("/");
@@ -773,16 +796,16 @@ async function loadPan123Picker(parentId: number, jumpTo = false) {
   }
 }
 
-async function openPan123Picker(mode: "helper" | "pool" = "helper") {
+async function openPan123Picker(mode: "helper" | "pool" | "monitor" = "helper") {
   pan123PickerMode.value = mode;
   pan123PickerPath.value = [];
   pan123PickerDirs.value = [];
   pan123PickerFiles.value = [];
   pan123PickerOpen.value = true;
   // 若已配置目录 ID，跳到该目录方便直接确认；路径以当前配置为准
-  const savedId = Number(mode === "pool" ? poolDirId.value : helperForm.pan123SourceDirId) || 0;
+  const savedId = Number(mode === "pool" ? poolDirId.value : mode === "monitor" ? transferForm.tg115MonitorTargetDirId : helperForm.pan123SourceDirId) || 0;
   if (savedId) {
-    const savedPath = mode === "pool" ? poolDirPath.value : helperForm.pan123SourceDirPath;
+    const savedPath = mode === "pool" ? poolDirPath.value : mode === "monitor" ? monitorTargetPath.value : helperForm.pan123SourceDirPath;
     pan123PickerPath.value = [{ fileId: savedId, name: savedPath ? savedPath.split("/").filter(Boolean).pop() || "已选目录" : "已选目录" }];
   }
   await loadPan123Picker(pan123PickerTargetId(), true);
@@ -807,6 +830,13 @@ function pan123PickerGoRoot() {
 
 function pan123PickerConfirm() {
   const id = pan123PickerTargetId();
+  if (pan123PickerMode.value === "monitor") {
+    transferForm.tg115MonitorTargetDirId = String(id);
+    monitorTargetPath.value = pan123PickerPathText();
+    pan123PickerOpen.value = false;
+    notifySuccess("已选择监控搬运目标目录，请保存频道监控配置");
+    return;
+  }
   if (pan123PickerMode.value === "pool") {
     poolDirId.value = String(id);
     poolDirPath.value = pan123PickerPathText();
@@ -1114,7 +1144,7 @@ async function reusePoolSelection() {
 function ensureTabLoaded(key: HubTab) {
   if (loadedTabs[key]) return;
   loadedTabs[key] = true;
-  if (key === "transfer") {
+  if (key === "transfer" || key === "monitor") {
     loadTransfer();
   } else if (key === "helper") {
     refreshHelperStatus();
@@ -1157,6 +1187,7 @@ watch(() => state.loaded, (loaded) => {
 
 const tabsList = [
   { key: "transfer", label: "搬运", icon: "mdi-cloud-sync" },
+  { key: "monitor", label: "频道监控", icon: "mdi-telegram" },
   { key: "helper", label: "助手", icon: "mdi-tools" },
   { key: "cookie", label: "扫码", icon: "mdi-cookie" },
   { key: "pool", label: "秒传池", icon: "mdi-database-search" },
@@ -1411,6 +1442,7 @@ onUnmounted(() => {
               </div>
               <FormGrid>
                 <v-switch v-model="transferForm.enabled" label="启用 115 搬运" color="primary" hide-details />
+                <v-switch v-model="transferForm.autoPublishFastlink" label="搬运全部成功后按频道路由自动发布秒传帖" color="primary" hide-details />
                 <v-text-field
                   v-model="transferForm.targetDirId"
                   label="123 目标目录 ID"
@@ -1606,6 +1638,29 @@ onUnmounted(() => {
           </v-card-text>
         </v-card>
       </v-dialog>
+    </div>
+
+    <!-- ====================== TG 115 channel monitor ====================== -->
+    <div v-show="tab === 'monitor'" class="section-stack">
+      <GlassCard accent="group" icon="mdi-telegram" title="TG 频道监控" desc="单独指定来源频道和 123 目标目录；115 分享使用搬运 Cookie 账号池轮换。" :hover="false">
+        <FormGrid>
+          <v-switch v-model="transferForm.tg115MonitorEnabled" label="启用频道监控与自动搬运" color="primary" hide-details />
+          <v-text-field v-model="transferForm.tg115MonitorChannel" label="TG 来源频道" placeholder="@ChannelName、https://t.me/ChannelName 或 -1001234567890" hint="公开频道填字母用户名（@ChannelName）或 t.me 链接；私有频道填 -100 开头的数字 ID。登录的 TG 用户须能访问该频道。" persistent-hint variant="outlined" density="compact" />
+          <div class="d-flex align-center ga-2 flex-wrap">
+            <v-btn variant="outlined" prepend-icon="mdi-folder-open-outline" @click="openPan123Picker('monitor')">选择 123 目标文件夹…</v-btn>
+            <span class="muted-hint">{{ monitorTargetPath || (transferForm.tg115MonitorTargetDirId === '0' ? '根目录' : '已选文件夹 ID ' + transferForm.tg115MonitorTargetDirId) }}</span>
+          </div>
+          <div class="muted-hint">此目录只用于 TG 频道监控任务，不会改变普通 115 搬运的目标目录。请选择文件夹后点「保存频道监控配置」。</div>
+        </FormGrid>
+        <div class="hub-status-line">{{ tg115MonitorStatus || "监控状态读取中" }}</div>
+        <p class="muted-hint">账号池共用「搬运 → 搬运设置」里的 115 Cookie 池。可手动逐行粘贴多个 Cookie（账号名|Cookie），监控任务会按分享码分散到不同账号，失效账号自动冷却并尝试其他账号。TG API ID、Hash、用户 Session 在「投稿机器人」配置。</p>
+        <v-textarea v-model="transferForm.pan115Cookie" label="115 Cookie 账号池（可手动输入）" placeholder="每行一个：账号名|UID=...; CID=...; SEID=..." :rows="5" variant="outlined" density="compact" />
+        <div class="button-row">
+          <v-btn color="primary" :loading="transferSaving" @click="saveTransfer">保存频道监控配置</v-btn>
+          <v-btn variant="outlined" :loading="transferLoading" @click="loadTransfer">刷新状态</v-btn>
+          <v-btn variant="text" @click="tab = 'transfer'; transferSettingsOpen = true">管理 115 Cookie 池</v-btn>
+        </div>
+      </GlassCard>
     </div>
 
     <!-- ====================== Helper Tab ====================== -->
@@ -1902,7 +1957,7 @@ onUnmounted(() => {
       <v-card class="dir-picker-card">
         <v-card-title class="dir-picker-title">
           <v-icon icon="mdi-folder-open-outline" size="22" class="mr-2" />
-          选择 123 网盘源目录
+          {{ pan123PickerMode === 'monitor' ? '选择监控搬运目标文件夹' : pan123PickerMode === 'pool' ? '选择秒传目标文件夹' : '选择 123 网盘源目录' }}
         </v-card-title>
         <v-card-text>
           <div class="dir-picker-breadcrumb">
@@ -1918,7 +1973,7 @@ onUnmounted(() => {
           <v-divider class="my-2" />
           <div v-if="pan123PickerLoading" class="empty-state"><p>目录加载中…</p></div>
           <div v-else-if="!pan123PickerDirs.length && !pan123PickerFiles.length" class="empty-state">
-            <p>此目录为空。可点击下方「选择此目录」将其设为源目录。</p>
+            <p>此目录为空。可点击下方「选择此目录」使用当前目录。</p>
           </div>
           <div v-else class="dir-picker-list">
             <v-list-item

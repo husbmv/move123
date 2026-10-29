@@ -23,6 +23,56 @@ interface DesktopInfo {
 
 const { theme, setTheme } = useTheme();
 const { state, notifySuccess, notifyError, confirm, loadStatus } = useGlobalState();
+const webAuthEnabled = ref(false);
+const accountUsername = ref("admin");
+const accountNewUsername = ref("");
+const currentPassword = ref("");
+const newPassword = ref("");
+const passwordSaving = ref(false);
+const proxyUrl = ref("");
+const proxySaving = ref(false);
+
+async function saveWebProxy() {
+  proxySaving.value = true;
+  try {
+    const response = await fetch("/api/web-auth/proxy", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: proxyUrl.value.trim() }),
+    });
+    if (!response.ok) throw new Error((await response.json()).detail || "保存失败");
+    notifySuccess("TG 与 TMDB 代理已保存并生效");
+  } catch (error) {
+    notifyError(error instanceof Error ? error.message : "保存失败");
+  } finally {
+    proxySaving.value = false;
+  }
+}
+
+async function changeWebPassword() {
+  passwordSaving.value = true;
+  try {
+    const response = await fetch("/api/web-auth/password", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: accountUsername.value, currentPassword: currentPassword.value, newPassword: newPassword.value, newUsername: accountNewUsername.value }),
+    });
+    if (!response.ok) throw new Error((await response.json()).detail || "修改失败");
+    currentPassword.value = "";
+    newPassword.value = "";
+    notifySuccess("后台账号已修改，请重新登录");
+    window.location.assign("/admin/login");
+  } catch (error) {
+    notifyError(error instanceof Error ? error.message : "修改失败");
+  } finally {
+    passwordSaving.value = false;
+  }
+}
+
+async function logoutWeb() {
+  await fetch("/api/web-auth/logout", { method: "POST" });
+  window.location.assign("/admin/login");
+}
 
 const desktopInfo = ref<DesktopInfo | null>(null);
 const backendVersion = computed(() => (state.status ? "已连接" : "未连接"));
@@ -31,6 +81,7 @@ const backendVersion = computed(() => (state.status ? "已连接" : "未连接")
 const pan123 = computed(() => state.status?.pan123);
 const pan123Authenticated = computed(() => Boolean(pan123.value?.authenticated));
 const pan123LoginExpired = computed(() => Boolean(pan123.value?.loginExpired));
+const pan123AccessOnly = computed(() => Boolean(pan123.value?.accessOnly));
 const pan123Profile = computed(() => pan123.value?.profile || null);
 const pan123Name = computed(() => displayName(pan123Profile.value || null, pan123.value?.user || ""));
 const pan123Space = computed(() => {
@@ -49,6 +100,7 @@ const authorizeUrl = ref("");
 const authorizeNonce = ref("");
 const callbackInput = ref("");
 const finishing = ref(false);
+const readingCallback = ref(false);
 
 interface OauthPopupResult {
   callbackUrl?: string;
@@ -70,10 +122,16 @@ function desktopBridge() {
 }
 
 async function authorizePan123() {
+  const bridge = desktopBridge();
+  // window.open 必须在用户点击事件的同步阶段调用；等待 API 后再调用会被浏览器拦截。
+  const popup = bridge?.openPan123Oauth ? null : window.open("about:blank", "_blank");
+  if (popup) {
+    popup.document.title = "123 云盘授权准备中";
+    popup.document.body.textContent = "正在获取 123 云盘官方授权地址，请稍候…";
+  }
   authorizing.value = true;
   try {
     const start = await adminApi.oauthStart();
-    const bridge = desktopBridge();
     if (bridge?.openPan123Oauth) {
       // 桌面端：弹窗打开 123 官方授权页（账号密码在官方页输入），自动截获回调
       const result = await bridge.openPan123Oauth({ authorizeUrl: start.authorizeUrl, redirectUri: start.redirectUri });
@@ -89,41 +147,115 @@ async function authorizePan123() {
       notifySuccess("123 网盘授权成功");
       await loadStatus();
     } else {
-      // 浏览器模式：新标签打开授权页，授权后把回调地址/刷新令牌粘贴回来
+      // 浏览器模式：尝试打开预先创建的标签；被拦截时仍可点击下方链接手动打开。
       authorizeUrl.value = start.authorizeUrl;
       authorizeNonce.value = start.nonce;
       callbackInput.value = "";
       browserAuthOpen.value = true;
+      if (popup && !popup.closed) {
+        popup.opener = null;
+        popup.location.href = start.authorizeUrl;
+      }
     }
   } catch (error) {
+    if (popup && !popup.closed) popup.close();
     notifyError(`发起授权失败：${error instanceof Error ? error.message : String(error)}`);
   } finally {
     authorizing.value = false;
   }
 }
 
+async function importAccessToken() {
+  const value = callbackInput.value.trim();
+  if (!value) {
+    notifyError("请先粘贴 123 访问令牌");
+    return;
+  }
+  finishing.value = true;
+  try {
+    await adminApi.oauthImportAccess(value);
+    browserAuthOpen.value = false;
+    authorizeUrl.value = "";
+    callbackInput.value = "";
+    notifySuccess("访问令牌已保存；到期后需重新授权");
+    await loadStatus();
+  } catch (error) {
+    notifyError(`访问令牌导入失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    finishing.value = false;
+  }
+}
+
 async function finishBrowserAuth() {
   const value = callbackInput.value.trim();
   if (!value) {
-    notifyError("请粘贴授权后的完整回调地址，或直接粘贴刷新令牌");
+    notifyError("请粘贴授权后的完整回调地址、刷新令牌或访问令牌");
     return;
   }
   finishing.value = true;
   try {
     if (value.toLowerCase().startsWith("http")) {
+      if (value.includes("#") && !value.includes("?code=")) {
+        const parsed = new URL(value);
+        const redirect = authorizeUrl.value ? new URL(authorizeUrl.value).searchParams.get("redirect_uri") : null;
+        const expected = redirect ? new URL(redirect) : null;
+        if (!expected || parsed.origin !== expected.origin) {
+          throw new Error("回调地址来源不匹配，请复制本次授权的完整地址");
+        }
+      }
       await adminApi.oauthFinish(authorizeNonce.value, value);
     } else {
-      await adminApi.oauthImport(value);
+      const kind = tokenKind(value);
+      if (kind === "access") {
+        await adminApi.oauthImportAccess(value);
+      } else {
+        await adminApi.oauthImport(value);
+      }
     }
     browserAuthOpen.value = false;
     authorizeUrl.value = "";
     callbackInput.value = "";
-    notifySuccess("123 网盘授权成功");
+    notifySuccess(tokenKind(value) === "access" ? "访问令牌已导入；到期后需重新授权" : "123 网盘授权成功");
     await loadStatus();
   } catch (error) {
     notifyError(`授权失败：${error instanceof Error ? error.message : String(error)}`);
   } finally {
     finishing.value = false;
+  }
+}
+
+function tokenKind(value: string): "access" | "refresh" {
+  const parts = value.split(".");
+  if (parts.length !== 3) return "refresh";
+  try {
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (typeof payload?.exp === "number") return "access";
+  } catch { /* 不是 JWT，按刷新令牌交由后端校验。 */ }
+  return "refresh";
+}
+
+async function pasteAndFinishBrowserAuth() {
+  readingCallback.value = true;
+  try {
+    if (!navigator.clipboard?.readText) {
+      throw new Error("当前浏览器不支持读取剪贴板，请手动粘贴回调地址");
+    }
+    const value = (await navigator.clipboard.readText()).trim();
+    if (!value) throw new Error("剪贴板为空，请先复制授权完成页的完整地址");
+    const parsed = new URL(value);
+    const redirect = authorizeUrl.value ? new URL(authorizeUrl.value).searchParams.get("redirect_uri") : null;
+    const expected = redirect ? new URL(redirect) : null;
+    const matchesCallback = expected && parsed.origin === expected.origin && parsed.pathname === expected.pathname;
+    const matchesTokenPage = expected && parsed.origin === expected.origin && parsed.pathname === "/" && parsed.hash.length > 1;
+    if (!matchesCallback && !matchesTokenPage) {
+      throw new Error("剪贴板不是本次 123 授权的回调地址；请复制授权完成页地址栏的完整 URL");
+    }
+    callbackInput.value = value;
+    await finishBrowserAuth();
+  } catch (error) {
+    notifyError(error instanceof Error ? error.message : "读取剪贴板失败，请手动粘贴回调地址");
+  } finally {
+    readingCallback.value = false;
   }
 }
 
@@ -265,6 +397,16 @@ async function resetPoolToken() {
 }
 
 onMounted(async () => {
+  try {
+    const response = await fetch("/api/web-auth/state", { cache: "no-store" });
+    const auth = await response.json();
+    webAuthEnabled.value = auth.enabled === true;
+    if (auth.username) accountUsername.value = auth.username;
+    if (webAuthEnabled.value) {
+      const proxyResponse = await fetch("/api/web-auth/proxy", { cache: "no-store" });
+      if (proxyResponse.ok) proxyUrl.value = (await proxyResponse.json()).url || "";
+    }
+  } catch { /* desktop mode */ }
   void loadPoolToken();
   const api = desktopApi();
   if (api?.getInfo) {
@@ -284,6 +426,23 @@ onMounted(async () => {
 <template>
   <div class="page">
     <PageHero title="设置" desc="外观、服务端口、数据目录与应用信息。" icon="mdi-cog-outline" group="dashboard" />
+
+    <GlassCard v-if="webAuthEnabled" title="后台账号" desc="修改网页登录账号和密码；不限制密码复杂度。" icon="mdi-shield-account" :hover="false">
+      <v-text-field v-model="accountUsername" label="账号" variant="outlined" readonly />
+      <v-text-field v-model="accountNewUsername" label="新账号（留空不修改）" variant="outlined" autocomplete="username" />
+      <v-text-field v-model="currentPassword" label="当前密码" type="password" variant="outlined" autocomplete="current-password" />
+      <v-text-field v-model="newPassword" label="新密码" type="password" variant="outlined" autocomplete="new-password" />
+      <div class="d-flex ga-2">
+        <v-btn color="primary" :loading="passwordSaving" @click="changeWebPassword">修改账号与密码</v-btn>
+        <v-btn variant="outlined" @click="logoutWeb">退出登录</v-btn>
+      </div>
+    </GlassCard>
+
+    <GlassCard v-if="webAuthEnabled" title="TG / TMDB 代理" desc="填写同一个 HTTP 代理地址，供 Telegram 和 TMDB 出站请求使用。" icon="mdi-web" :hover="false">
+      <v-text-field v-model="proxyUrl" label="HTTP 代理地址" placeholder="http://host.docker.internal:7890" variant="outlined" hide-details />
+      <p class="muted" style="font-size: 12px; margin: 10px 0">请填写容器可访问的主机和端口；留空则不启用网页代理。保存后立即生效。</p>
+      <v-btn color="primary" :loading="proxySaving" @click="saveWebProxy">保存代理</v-btn>
+    </GlassCard>
 
     <div class="section-grid">
       <GlassCard title="外观" desc="液态玻璃支持浅色与深色两种质感。" icon="mdi-palette" :hover="false">
@@ -318,9 +477,13 @@ onMounted(async () => {
               <small>{{ pan123Space || "账号已连接" }}</small>
             </span>
             <span v-if="pan123LoginExpired" class="pan-bind-badge expired">授权已失效</span>
+            <span v-else-if="pan123AccessOnly" class="pan-bind-badge">仅访问令牌 · 到期需重新授权</span>
             <span v-else class="pan-bind-badge">已授权</span>
           </div>
           <div class="pan-bind-actions">
+            <v-btn v-if="pan123AccessOnly" variant="tonal" size="small" prepend-icon="mdi-key" @click="browserAuthOpen = true; authorizeUrl = ''">
+              更新访问令牌
+            </v-btn>
             <v-btn variant="tonal" color="primary" size="small" prepend-icon="mdi-refresh" :loading="authorizing" @click="authorizePan123">
               {{ pan123LoginExpired ? "重新授权" : "重新授权" }}
             </v-btn>
@@ -330,31 +493,44 @@ onMounted(async () => {
           </div>
         </div>
 
+        <div v-if="pan123Authenticated && pan123AccessOnly && browserAuthOpen && !authorizeUrl" class="pan-bind-form">
+          <v-text-field v-model="callbackInput" label="新的 123 访问令牌" type="password" variant="outlined" autocomplete="off" hide-details />
+          <v-btn color="primary" :loading="finishing" @click="importAccessToken">保存访问令牌</v-btn>
+        </div>
+
         <div v-else class="pan-bind-form">
           <v-btn color="primary" :loading="authorizing" prepend-icon="mdi-shield-check-outline" @click="authorizePan123">
             授权登录 123 网盘
           </v-btn>
+          <v-btn variant="outlined" :disabled="authorizing" prepend-icon="mdi-key" @click="browserAuthOpen = true">
+            手动输入访问令牌
+          </v-btn>
           <p class="muted" style="font-size: 11.5px; margin: 2px 0 0">
-            点击后会打开 123 云盘官方授权页，在官方页面输入账号密码并同意授权即可；本应用只保存授权后的
-            token，不经手你的密码，也无需申请开放平台密钥。
+            点击后会尝试在新标签打开 123 云盘官方授权页；若浏览器阻止弹窗，请点击下方出现的「123 官方授权页」链接。
+            只在官方页面输入账号密码；本应用只保存授权后的 token，无需申请开放平台密钥。
           </p>
 
           <template v-if="browserAuthOpen">
             <v-divider class="my-2" />
             <p class="muted" style="font-size: 12px; margin: 0">
-              浏览器模式：在新标签打开
-              <a :href="authorizeUrl" target="_blank" rel="noopener">123 官方授权页</a>
-              ，完成授权后把跳转回来的完整地址（或工具页显示的刷新令牌）粘贴到下面。
+              浏览器模式：<template v-if="authorizeUrl">在新标签打开 <a :href="authorizeUrl" target="_blank" rel="noopener">123 官方授权页</a>。完成授权后，复制最终页面地址栏的完整 URL（含 # 后面的内容），回到这里点「读取剪贴板并完成授权」。</template>
+              <template v-else>若已有 123 访问令牌，可直接在下方粘贴并保存。</template>
+              浏览器禁止本页直接读取第三方标签的地址，因此这一步需要你复制。也可以手动粘贴地址、刷新令牌或访问令牌；仅访问令牌到期后无法自动续期。
             </p>
             <v-text-field
               v-model="callbackInput"
-              label="回调地址 / 刷新令牌"
-              placeholder="https://api.oplist.org/123cloud/callback?code=… 或刷新令牌"
+              label="回调地址 / 刷新令牌 / 访问令牌"
+              type="password"
+              placeholder="完整回调地址，或刷新令牌 / 访问令牌"
               variant="outlined"
               density="comfortable"
               hide-details
             />
-            <v-btn color="primary" :loading="finishing" prepend-icon="mdi-check" @click="finishBrowserAuth">完成授权</v-btn>
+            <div class="d-flex ga-2 flex-wrap">
+              <v-btn v-if="authorizeUrl" color="primary" :loading="readingCallback || finishing" prepend-icon="mdi-content-paste" @click="pasteAndFinishBrowserAuth">读取剪贴板并完成授权</v-btn>
+              <v-btn v-else color="primary" :loading="finishing" prepend-icon="mdi-content-save" @click="importAccessToken">保存访问令牌</v-btn>
+              <v-btn variant="outlined" :loading="finishing" prepend-icon="mdi-check" @click="finishBrowserAuth">使用输入内容完成授权</v-btn>
+            </div>
           </template>
         </div>
       </GlassCard>

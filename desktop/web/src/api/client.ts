@@ -24,6 +24,9 @@ export async function readJson<T = unknown>(response: Response): Promise<T> {
   }
   const payload = data as { ok?: boolean; detail?: string; message?: string };
   if (!response.ok || payload.ok === false) {
+    if (response.status === 401 && window.location.pathname !== "/admin/login") {
+      window.location.assign("/admin/login?next=" + encodeURIComponent(window.location.pathname + window.location.search));
+    }
     const message = payload.detail || payload.message || `请求失败 (${response.status})`;
     throw new ApiError(message, response.status, payload.detail || "");
   }

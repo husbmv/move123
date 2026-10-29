@@ -34,6 +34,11 @@ import { useGlobalState } from "@/composables/useGlobalState";
 
 const { notifySuccess, notifyError, confirm } = useGlobalState();
 
+function browserTmdbImage(url: string): string {
+  const match = new RegExp("^https://image[.]tmdb[.]org/t/p/(w185|w342|w500|w780|w1280)/([A-Za-z0-9_-]+[.](?:jpg|jpeg|png|webp))$").exec(url);
+  return match ? "/api/library/tmdb-image/" + match[1] + "/" + match[2] : url;
+}
+
 type LibraryTab = "browse" | "config";
 const tabsList: Array<{ key: LibraryTab; label: string; icon: string }> = [
   { key: "browse", label: "搜索浏览", icon: "mdi-magnify" },
@@ -870,11 +875,11 @@ const posterCache: Record<string, string> = (() => {
 
 async function fetchPoster(work: LibraryWork): Promise<string> {
   const cacheKey = `${work.tmdbId || ""}|${work.title}|${work.year || ""}`;
-  if (posterCache[cacheKey] !== undefined) return posterCache[cacheKey];
+  if (posterCache[cacheKey] !== undefined) return browserTmdbImage(posterCache[cacheKey]);
   if (!work.tmdbId) return "";
   try {
     const data = await libraryApi.poster(work.tmdbId, work.title, work.year || 0, apiToken.value);
-    const url = String(data.url || "");
+    const url = browserTmdbImage(String(data.url || ""));
     if (url) {
       posterCache[cacheKey] = url;
       try {
@@ -893,7 +898,7 @@ async function fetchTmdbDetail(work: LibraryWork): Promise<TmdbDetail | null> {
   if (!work.tmdbId) return null;
   try {
     const data = await libraryApi.tmdbDetail(work.tmdbId, work.title, work.year || 0, apiToken.value);
-    return data.detail || null;
+    return data.detail ? { ...data.detail, posterUrl: browserTmdbImage(data.detail.posterUrl || "") } : null;
   } catch {
     return null;
   }
@@ -1017,7 +1022,7 @@ async function toggleWorkFiles(work: LibraryWork) {
   detailSelected.value = new Set();
   detailVersion.value = "__all__";
   detailInfo.value = work.tmdbStatus === "ok" && work.overview
-    ? { title: work.title, year: work.year || 0, overview: work.overview, voteAverage: work.voteAverage, genres: work.genres, posterUrl: work.posterPath }
+    ? { title: work.title, year: work.year || 0, overview: work.overview, voteAverage: work.voteAverage, genres: work.genres, posterUrl: browserTmdbImage(work.posterPath) }
     : null;
   dirFilesLoading.value = true;
   void fetchTmdbDetail(work).then((detail) => {
@@ -1372,7 +1377,7 @@ function backToSeasons() {
 }
 
 function seasonPosterUrl(season: number): string {
-  return seasonInfos.value[season]?.posterUrl || "";
+  return browserTmdbImage(seasonInfos.value[season]?.posterUrl || "");
 }
 
 async function startPlay(work: LibraryWork, payload: { season?: number; episode?: number; filePath?: string; resume?: boolean }) {
@@ -2754,7 +2759,7 @@ onUnmounted(() => {
               :title="`识别为 ${c.type === 'tv' ? '剧集' : '电影'}《${c.title}》`"
               @click="applyIdentify(c)"
             >
-              <img v-if="c.poster" :src="c.poster" loading="lazy" :alt="c.title" />
+              <img v-if="c.poster" :src="browserTmdbImage(c.poster)" loading="lazy" :alt="c.title" />
               <div v-else class="identify-poster-fallback">{{ c.type === "tv" ? "📺" : "🎬" }}</div>
               <div class="identify-meta">
                 <span class="identify-badge">{{ c.type === "tv" ? "剧集" : "电影" }}</span>
