@@ -113,6 +113,7 @@ async def make_link(client: Any, group: Dict[str, Any], mode: str) -> Dict[str, 
     """Return a share or V2 fastlink (folder: uploaded short seed link)."""
     name = str(group["name"])
     files = group["files"]
+    document = None
     if mode == "share":
         url = await client.create_share(int(group["fileId"]), name)
         provider = "123pan"
@@ -138,9 +139,13 @@ async def make_link(client: Any, group: Dict[str, Any], mode: str) -> Dict[str, 
         seed = await client.upload_text_file(seed_dir, seed_name, payload)
         url = f"123FLCPV2$%{hex_to_base62(seed['etag'])}#{seed['size']}#{seed_name}"
         provider = "123fastlink"
+        document = {"type": "fastlink_json", "fileName": seed_name, "mimeType": "application/json", "content": payload}
     file_names = [str(file["path"]) for file in files]
     source_text = "\n".join([name, *file_names[:100]])
     inspection = {"title": name, "fileNames": file_names,
                   "size": format_size(group["size"]), "rawText": source_text}
-    return {"link": {"provider": provider, "url": url, "cleanUrl": url,
-                     "title": name, "sourceText": source_text}, "inspection": inspection}
+    result = {"link": {"provider": provider, "url": url, "cleanUrl": url,
+                       "title": name, "sourceText": source_text}, "inspection": inspection}
+    if document:
+        result["document"] = document
+    return result

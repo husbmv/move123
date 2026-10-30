@@ -55,6 +55,8 @@ def test_discover_direct_children_and_links():
     assert parsed["files"][0]["fileName"].endswith(".123fastlink.json")
     payload = json.loads(cloud.uploads[0][2])
     assert payload["files"][0]["path"] == "电影 (2026)/Season 1/E01.mkv"
+    assert folder["document"]["fileName"].endswith(".123fastlink.json")
+    assert folder["document"]["content"] == cloud.uploads[0][2]
     single = run(auto_submission.make_link(cloud, groups[1], "fastlink"))
     assert parse_fastlink_text(single["link"]["url"])["files"][0]["size"] == 12
     shared = run(auto_submission.make_link(cloud, groups[0], "share"))
@@ -82,3 +84,14 @@ def test_scan_receipt_and_failed_retry():
         assert (first["published"], first["failed"]) == (1, 1)
         assert (second["published"], second["skipped"]) == (1, 1)
         assert len(cloud.shares) == 2  # failed item's link reused from prepared cache
+
+
+def test_folder_fastlink_post_sends_json_document():
+    from app.submission import build_share_markup_row, normalize_submission_documents
+    cloud = FakeCloud()
+    groups = run(auto_submission.discover(cloud, "10"))
+    prepared = run(auto_submission.make_link(cloud, groups[0], "fastlink"))
+    draft = {"shareDisplayFastlink": True, "share": {"provider": "123fastlink", "cleanUrl": prepared["link"]["url"]}, "documents": [prepared["document"]]}
+    docs = normalize_submission_documents(draft["documents"])
+    assert docs[0]["fileName"].endswith(".123fastlink.json")
+    assert build_share_markup_row(draft, {}) is None

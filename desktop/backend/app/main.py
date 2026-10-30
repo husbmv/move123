@@ -251,7 +251,7 @@ async def app_lifespan(_app: FastAPI):
         await stop_background_tasks()
 
 
-app = FastAPI(title="123 Cloud Gateway", version="1.1.0", lifespan=app_lifespan)
+app = FastAPI(title="123 Cloud Gateway", version="1.1.1", lifespan=app_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1187,8 +1187,11 @@ async def run_auto_submission_scan() -> Dict[str, Any]:
                     prepared = cached if isinstance(cached, dict) and cached.get("link") and cached.get("inspection") else await auto_submission.make_link(client, group, config["mode"])
                     if not cached:
                         store.write_value(prepared_key, prepared)
+                    link = dict(prepared["link"])
+                    if config["mode"] == "fastlink" and isinstance(prepared.get("document"), dict):
+                        link["document"] = prepared["document"]
                     draft = await build_submission_draft(
-                        submission, prepared["link"], prepared["inspection"], "123 目录自动投稿",
+                        submission, link, prepared["inspection"], "123 目录自动投稿",
                         owner_chat_id=owner, owner_user_id=owner, store=store,
                     )
                     channel, _ = route_submission_draft(store, owner, draft)
@@ -1631,7 +1634,7 @@ def ms_to_iso(ms: int) -> str:
 
 @app.get("/api/health")
 async def health() -> Dict[str, Any]:
-    return {"ok": True, "name": "123 Cloud Gateway", "version": "1.1.0"}
+    return {"ok": True, "name": "123 Cloud Gateway", "version": "1.1.1"}
 
 
 @app.get("/api/logs")

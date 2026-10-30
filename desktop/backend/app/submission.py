@@ -852,6 +852,11 @@ def render_submission_caption(
     database_block = database_note_rich_block(draft)
     if database_block:
         caption = f"{caption}\n\n{database_block}" if caption else database_block
+    share = draft.get("share") if isinstance(draft.get("share"), dict) else {}
+    fastlink = str(share.get("cleanUrl") or share.get("url") or "").strip()
+    if draft.get("shareDisplayFastlink") and fastlink.startswith(("123FLCPV2$", "123FSLinkV2$")):
+        block = f"🔗 秒传链接：\n<code>{escape(fastlink)}</code>"
+        caption = f"{caption}\n\n{block}" if caption else block
     return caption
 
 
@@ -2259,11 +2264,6 @@ def render_rating(value: Any, url: str = "") -> str:
 
 
 def render_share_link(draft: Dict[str, Any], config: Dict[str, Any]) -> str:
-    if draft.get("shareDisplayFastlink"):
-        share = draft.get("share") if isinstance(draft.get("share"), dict) else {}
-        link = str(share.get("cleanUrl") or share.get("url") or "").strip()
-        if link.startswith(("123FLCPV2$", "123FSLinkV2$")):
-            return f"<code>{escape(link)}</code>"
     templates = config.get("templates") if isinstance(config.get("templates"), dict) else {}
     name = escape(submission_share_name(draft, config))
     # A collaborator is attributed to their Telegram profile, not to the
@@ -2813,6 +2813,9 @@ def build_share_markup_row(draft: Dict[str, Any], config: Dict[str, Any]) -> Opt
     share = draft.get("share") if isinstance(draft.get("share"), dict) else {}
     clean_url = str(share.get("cleanUrl") or share.get("url") or "").strip()
     provider = str(share.get("provider") or "")
+    if draft.get("shareDisplayFastlink") and any(str(item.get("type") or "") == "fastlink_json" for item in normalize_submission_documents(draft.get("documents") or [])):
+        # Folder posts attach the JSON file itself; keep the message uncluttered.
+        return None
     if provider == "123fastlink" and clean_url.startswith("123FLCPV2$"):
         # 同预览键盘：超过 copy_text 256 字符上限的链接不发按钮；
         # 频道不再附带秒传 JSON 文件，秒传内容靠这条复制按钮（二级短链必不超限）。
@@ -3405,7 +3408,7 @@ async def send_submission_seed_documents(bot_token: str, chat_id: Any, draft: Di
         for document in normalize_submission_documents(draft.get("documents") or []):
             # 频道帖不再附带秒传 JSON 文件：秒传内容改由「秒传链接」复制按钮承载。
             # 这里兜底过滤旧存量草稿，避免重发时又把 JSON 文件挂到频道。
-            if str(document.get("type") or "") == "fastlink_json":
+            if str(document.get("type") or "") == "fastlink_json" and not draft.get("shareDisplayFastlink"):
                 continue
             sent = await send_telegram_document(
                 bot_token,

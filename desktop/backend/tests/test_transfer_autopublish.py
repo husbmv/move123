@@ -25,7 +25,9 @@ class AutoPublishTests(__import__("unittest").TestCase):
     assert parsed["files"][0]["size"] == 123
     assert parsed["files"][0]["path"] == "Episode.mkv"
     assert publishable_files(_task("partial")) == []
-    caption = render_submission_caption({"share": {"cleanUrl": link}, "shareDisplayFastlink": True, "media": {"title": "测试影片", "year": "2026", "tmdbId": 42, "overview": "简介", "genres": ["动作"]}, "metadata": {}}, {"templates": {"caption": "🎬 {title}\n👤 分享：{shareLink}"}})
+    caption = render_submission_caption({"share": {"cleanUrl": link}, "shareDisplayFastlink": True, "media": {"title": "测试影片", "year": "2026", "tmdbId": 42, "overview": "简介", "genres": ["动作"]}, "metadata": {}}, {"templates": {"shareName": "123", "shareUrl": "https://t.me/example", "caption": "🎬 {title}\n👤 分享：{shareLink}"}})
+    assert '分享：<a href="https://t.me/example">123</a>' in caption
+    assert "🔗 秒传链接" in caption
     assert "测试影片" in caption and link in caption
     assert "<code>" in caption
 
