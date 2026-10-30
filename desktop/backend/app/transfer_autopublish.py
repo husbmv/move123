@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import re
-from html import escape
 from typing import Any, Dict, List
 
 from .movie_library import hex_to_base62
-from .submission import build_tags_text
 
 
 MD5_RE = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -39,42 +37,3 @@ def file_fastlink(file: Dict[str, Any], etag: str) -> str:
 def file_path(file: Dict[str, Any]) -> str:
     parts = [str(part or "").strip() for part in file.get("path") or []]
     return "/".join([*filter(None, parts), str(file.get("name") or "")])
-
-
-def render_reference_caption(draft: Dict[str, Any], filename: str, size_text: str, fastlink: str) -> str:
-    """Caption layout inspired by public Pan123Movie posts, retaining available metadata."""
-    media = draft.get("media") if isinstance(draft.get("media"), dict) else {}
-    metadata = draft.get("metadata") if isinstance(draft.get("metadata"), dict) else {}
-    title = str(media.get("title") or metadata.get("title") or filename).strip()
-    year = str(media.get("year") or metadata.get("year") or "").strip()
-    name = title if not year or f"({year})" in title else f"{title} ({year})"
-    episode = str(metadata.get("seasonEpisode") or "").strip()
-    if episode and episode not in name:
-        name += " " + episode
-    if not name:
-        name = filename
-    tags = build_tags_text(title, media.get("genres") or [])
-    media_type = "电影" if str(media.get("mediaType") or metadata.get("mediaType") or "") == "movie" else "剧集"
-    region = str(media.get("region") or "").strip()
-    lines = [f"<b>{escape(name)}</b>", f"🏷️ 标签：{escape(tags)}", f"📺 类型：{escape(region + media_type if region else media_type)}"]
-    first_air_date = str(media.get("firstAirDate") or media.get("releaseDate") or "").strip()
-    if first_air_date:
-        lines.append(f"📅 首播：{escape(first_air_date)}")
-    rating = media.get("voteAverage")
-    rating_parts = []
-    if rating not in (None, ""):
-        rating_parts.append(f"TMDB: {escape(str(rating))}")
-    douban_rating = media.get("doubanRating")
-    if douban_rating not in (None, ""):
-        rating_parts.append(f"豆瓣: {escape(str(douban_rating))}")
-    if rating_parts:
-        lines.append("⭐ 评分：" + " | ".join(rating_parts))
-    tmdb_id = media.get("tmdbId") or metadata.get("tmdbId")
-    if tmdb_id:
-        lines.append(f"🆔 TMDB：{escape(str(tmdb_id))}")
-    overview = str(media.get("overview") or "").strip()
-    if overview:
-        lines.append(f"📝 简介：{escape(overview[:600])}")
-    version = " ".join(str(metadata.get(key) or "").strip() for key in ("quality", "webSource", "resourceType", "videoCodec", "effect", "audioCodec") if str(metadata.get(key) or "").strip())
-    lines.extend([f"🖼️ 版本：{escape(version or filename)}", f"💾 体积：{escape(size_text)}", "🔗 分享链接：", escape(fastlink)])
-    return chr(10).join(lines)

@@ -10,6 +10,8 @@ import type {
   Pan123BrowseItem,
   Pan123BrowseResult,
   SubmissionConfig,
+  AutoSubmissionConfig,
+  AutoSubmissionStatus,
   SubmissionDraft,
   SubmissionStatus,
   SubmissionDisplayPreview,
@@ -73,6 +75,10 @@ export const submissionApi = {
   putConfig: (config: SubmissionConfig) => api.put<{ ok: boolean; config: SubmissionConfig }>("/api/submission/config", config),
   previewDisplay: (config: SubmissionConfig, sample?: SubmissionDisplayPreviewSample) =>
     api.post<{ ok: boolean; preview: SubmissionDisplayPreview }>("/api/submission/display/preview", { config, sample }),
+  autoConfig: () => api.get<{ ok: boolean; config: AutoSubmissionConfig }>("/api/submission/auto/config"),
+  putAutoConfig: (config: AutoSubmissionConfig) => api.put<{ ok: boolean; config: AutoSubmissionConfig }>("/api/submission/auto/config", config),
+  autoStatus: () => api.get<{ ok: boolean; status: AutoSubmissionStatus }>("/api/submission/auto/status"),
+  autoScan: () => api.post<{ ok: boolean; status: AutoSubmissionStatus }>("/api/submission/auto/scan", {}),
   status: () => api.get<SubmissionStatus>("/api/submission/status"),
   testBot: (token: string) => api.post<{ ok: boolean; message: string }>("/api/submission/test/bot", { token }),
   testTelegramApi: (payload: { apiId: string; apiHash: string; session: string }) =>

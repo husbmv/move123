@@ -33,7 +33,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR") or ROOT_DIR / "data")
 setup_logging(DATA_DIR)
 
 from .directlink import read_directlink_status, serve_directlink_file, submit_arbitrary_urls_offline, submit_directlink_offline
-from . import library_playback, library_transfer, library_fastlink_import, movie_library, movie_library_db
+from . import auto_submission, library_playback, library_transfer, library_fastlink_import, movie_library, movie_library_db
 from .pan115 import CODE_RE as PAN123_CODE_RE, empty_115_recycle, extract_pan115_offline_links, helper_status, submit_115_offline_from_text
 from .pan115_cookie import (
     PAN115_QR_DEVICES,
@@ -97,7 +97,7 @@ from .telegram_session import (
     verify_code,
 )
 from . import web_auth
-from .transfer_autopublish import file_fastlink, file_path, publishable_files, render_reference_caption, MD5_RE
+from .transfer_autopublish import file_fastlink, file_path, publishable_files, MD5_RE
 from .telegram_115_monitor import STATUS_KEY as TG115_MONITOR_STATUS_KEY, monitor_loop as tg115_monitor_loop, normalize_channel as normalize_tg115_channel
 from .submission import format_size as submission_format_size
 from .network_proxy import httpx_proxy, set_web_proxy_url, web_proxy_url
@@ -190,6 +190,10 @@ pan115_recycle_cleanup_task: Optional[asyncio.Task[None]] = None
 telegram_callback_polling_task: Optional[asyncio.Task[None]] = None
 library_enrich_task: Optional[asyncio.Task[None]] = None
 tg115_monitor_task: Optional[asyncio.Task[None]] = None
+auto_submission_task: Optional[asyncio.Task[None]] = None
+auto_submission_scan_lock: Optional[asyncio.Lock] = None
+AUTO_SUBMISSION_CONFIG_KEY = "auto_submission_config"
+AUTO_SUBMISSION_STATUS_KEY = "auto_submission_status"
 # 影库分类充实（后台懒回填）：每批条数 / 相邻请求间隔 / 无活时空闲 / 单作品失败重试阈值
 LIBRARY_ENRICH_BATCH = 40
 LIBRARY_ENRICH_REQ_GAP = 0.25
@@ -247,7 +251,7 @@ async def app_lifespan(_app: FastAPI):
         await stop_background_tasks()
 
 
-app = FastAPI(title="123 Cloud Gateway", version="1.0.0", lifespan=app_lifespan)
+app = FastAPI(title="123 Cloud Gateway", version="1.1.0", lifespan=app_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -355,13 +359,15 @@ async def update_web_proxy_config(payload: _WebProxyUpdate):
 
 
 async def start_background_tasks() -> None:
-    global pan115_recycle_cleanup_task, telegram_callback_polling_task, library_enrich_task, tg115_monitor_task
+    global pan115_recycle_cleanup_task, telegram_callback_polling_task, library_enrich_task, tg115_monitor_task, auto_submission_task
     await start_telegram_client()
     transfer_service.set_queued_notifier(send_telegram_transfer_queued_messages)
     transfer_service.set_notifier(send_telegram_transfer_status_message)
     transfer_service.set_publish_notifier(publish_completed_transfer_fastlinks)
     if tg115_monitor_task is None or tg115_monitor_task.done():
         tg115_monitor_task = asyncio.create_task(tg115_monitor_loop(store, transfer_service))
+    if auto_submission_task is None or auto_submission_task.done():
+        auto_submission_task = asyncio.create_task(auto_submission_loop())
     transfer_service.set_cookie_notifier(send_telegram_account_expired_message)
     transfer_service.set_cleanup_notifier(cleanup_telegram_transfer_messages)
     if pan115_recycle_cleanup_task and not pan115_recycle_cleanup_task.done():
@@ -381,7 +387,7 @@ async def start_background_tasks() -> None:
 
 
 async def stop_background_tasks() -> None:
-    for task in (pan115_recycle_cleanup_task, telegram_callback_polling_task, library_enrich_task, tg115_monitor_task):
+    for task in (pan115_recycle_cleanup_task, telegram_callback_polling_task, library_enrich_task, tg115_monitor_task, auto_submission_task):
         if not task or task.done():
             continue
         task.cancel()
@@ -1109,21 +1115,123 @@ async def publish_completed_transfer_fastlinks(task: Dict[str, Any]) -> Dict[str
             channel, _ = route_submission_draft(store, owner_id, draft)
             if not channel or not str(channel.get("chatId") or "").strip():
                 raise ValueError("频道路由未匹配，未发布")
-            # A single-file link is safe to include in the caption. Preserve the
-            # structured share as fastlink for routing, but do not attach files.
-            draft["autoPublishCaption"] = render_reference_caption(draft, name, submission_format_size(size), fastlink)
+            # 与「投稿展示」共用 Caption；只把其中的分享位替换为秒传码。
+            # 频道仍附带短秒传的复制按钮，长秒传码可从正文复制。
+            draft["shareDisplayFastlink"] = True
             draft["id"] = draft_id
+            if any(str(item.get("id") or "") == draft_id for item in list_submission_drafts(store, 200)):
+                delete_submission_draft(store, draft_id)
             saved = append_submission_draft(store, draft)
             result = await publish_submission_draft(store, bot_token, config, saved, acting_user_id=owner_id)
             if not result.get("ok"):
+                # A failed send keeps the draft for manual retry instead of
+                # blocking every later transfer with a duplicate draft ID.
                 raise ValueError(f"频道发布失败：{result.get('reason') or '未知原因'}")
             store.write_value(key, {"channelId": result.get("channelId"), "messageId": result.get("messageId")})
             published += 1
         except Exception as error:
             failures.append(f"{name}：{error}")
+            logger.warning("搬运后自动投稿失败：%s：%s", name, error)
     if failures:
         return {"warning": f"自动发布 {published}/{len(files)} 条；失败示例：{failures[0][:160]}"}
     return {"published": published}
+
+
+def _auto_submission_owner(config: Dict[str, Any], submission: Dict[str, Any]) -> int:
+    configured = int(config.get("ownerUserId") or 0)
+    if configured > 0:
+        return configured if store.has_user_channel_config(configured) else 0
+    owners = [safe_int(value) for value in submission.get("channelOwnerUserIds") or []]
+    return next((owner for owner in owners if owner > 0 and store.has_user_channel_config(owner)), 0)
+
+
+def _auto_submission_status(**changes: Any) -> Dict[str, Any]:
+    old = store.read_value(AUTO_SUBMISSION_STATUS_KEY)
+    current = old if isinstance(old, dict) else {}
+    current = {**current, **changes, "updatedAt": utc_now_iso()}
+    store.write_value(AUTO_SUBMISSION_STATUS_KEY, current)
+    return current
+
+
+async def run_auto_submission_scan() -> Dict[str, Any]:
+    """Scan one level of selected directory; publish each child once per content revision."""
+    global auto_submission_scan_lock
+    if auto_submission_scan_lock is None:
+        auto_submission_scan_lock = asyncio.Lock()
+    if auto_submission_scan_lock.locked():
+        raise RuntimeError("自动投稿扫描正在运行")
+    async with auto_submission_scan_lock:
+        published = skipped = failed = 0
+        failures: List[str] = []
+        try:
+            config = auto_submission.normalize_config(store.read_value(AUTO_SUBMISSION_CONFIG_KEY))
+            submission = store.read_submission_config()
+            bot_token = str(submission.get("botToken") or "").strip()
+            owner = _auto_submission_owner(config, submission)
+            if not bot_token or not owner:
+                raise ValueError("请先配置 Bot Token、频道所有者 UID 和频道路由")
+            client = await transfer_service.create_status_pan123_client()
+            _auto_submission_status(state="running", error="", rootDirId=config["rootDirId"])
+            groups = await auto_submission.discover(client, config["rootDirId"])
+            for group in groups:
+                key = f"autoSubmission:{config['rootDirId']}:{group['fileId']}:{config['mode']}:{group['fingerprint']}"
+                if store.read_value(key):
+                    skipped += 1
+                    continue
+                name = str(group["name"])
+                try:
+                    if group.get("error"):
+                        raise ValueError(str(group["error"]))
+                    prepared_key = "prepared:" + key
+                    cached = store.read_value(prepared_key)
+                    prepared = cached if isinstance(cached, dict) and cached.get("link") and cached.get("inspection") else await auto_submission.make_link(client, group, config["mode"])
+                    if not cached:
+                        store.write_value(prepared_key, prepared)
+                    draft = await build_submission_draft(
+                        submission, prepared["link"], prepared["inspection"], "123 目录自动投稿",
+                        owner_chat_id=owner, owner_user_id=owner, store=store,
+                    )
+                    channel, _ = route_submission_draft(store, owner, draft)
+                    if not channel or not str(channel.get("chatId") or "").strip():
+                        raise ValueError("频道路由未匹配")
+                    if config["mode"] == "fastlink":
+                        draft["shareDisplayFastlink"] = True
+                    draft["id"] = uuid.uuid5(uuid.NAMESPACE_URL, key).hex
+                    if any(str(item.get("id") or "") == draft["id"] for item in list_submission_drafts(store, 200)):
+                        # The previous attempt left a draft. Reuse its stable ID
+                        # without growing the draft list on every polling cycle.
+                        delete_submission_draft(store, draft["id"])
+                    saved = append_submission_draft(store, draft)
+                    result = await publish_submission_draft(store, bot_token, submission, saved, acting_user_id=owner)
+                    if not result.get("ok"):
+                        raise ValueError(str(result.get("reason") or "频道发布失败"))
+                    store.write_value(key, {"channelId": result.get("channelId"), "messageId": result.get("messageId"), "at": utc_now_iso()})
+                    store.delete_value(prepared_key)
+                    published += 1
+                except Exception as error:
+                    failed += 1
+                    failures.append(f"{name}：{error}")
+                    logger.warning("自动投稿失败：%s：%s", name, error)
+            status = _auto_submission_status(state="idle", scanned=len(groups), published=published,
+                                             skipped=skipped, failed=failed, error=failures[0] if failures else "")
+            return {"ok": True, "status": status}
+        except Exception as error:
+            _auto_submission_status(state="error", error=str(error))
+            raise
+
+
+async def auto_submission_loop() -> None:
+    while True:
+        try:
+            config = auto_submission.normalize_config(store.read_value(AUTO_SUBMISSION_CONFIG_KEY))
+            if config["enabled"]:
+                await run_auto_submission_scan()
+            await asyncio.sleep(config["intervalSec"] if config["enabled"] else 15)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("自动投稿扫描失败：%s", error)
+            await asyncio.sleep(60)
 
 
 async def cleanup_telegram_transfer_messages(payload: Dict[str, Any]) -> None:
@@ -1397,6 +1505,15 @@ class SubmissionDisplayPreviewRequest(BaseModel):
     sample: Dict[str, Any] = Field(default_factory=dict)
 
 
+class AutoSubmissionConfigRequest(BaseModel):
+    enabled: bool = False
+    rootDirId: str = "0"
+    rootDirPath: str = ""
+    mode: str = "fastlink"
+    ownerUserId: int = 0
+    intervalSec: int = 300
+
+
 class BotTestRequest(BaseModel):
     token: str = ""
 
@@ -1514,7 +1631,7 @@ def ms_to_iso(ms: int) -> str:
 
 @app.get("/api/health")
 async def health() -> Dict[str, Any]:
-    return {"ok": True, "name": "123 Cloud Gateway", "version": "1.0.0"}
+    return {"ok": True, "name": "123 Cloud Gateway", "version": "1.1.0"}
 
 
 @app.get("/api/logs")
@@ -1715,6 +1832,35 @@ async def write_submission_config(config: Dict[str, Any]) -> Dict[str, Any]:
 @app.post("/api/submission/display/preview")
 async def preview_submission_display(request: SubmissionDisplayPreviewRequest) -> Dict[str, Any]:
     return {"ok": True, "preview": build_submission_display_preview(request.config, request.sample)}
+
+
+@app.get("/api/submission/auto/config")
+async def read_auto_submission_config() -> Dict[str, Any]:
+    return {"ok": True, "config": auto_submission.normalize_config(store.read_value(AUTO_SUBMISSION_CONFIG_KEY))}
+
+
+@app.put("/api/submission/auto/config")
+async def write_auto_submission_config(request: AutoSubmissionConfigRequest) -> Dict[str, Any]:
+    try:
+        config = auto_submission.normalize_config(request.dict())
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    store.write_value(AUTO_SUBMISSION_CONFIG_KEY, config)
+    return {"ok": True, "config": config}
+
+
+@app.get("/api/submission/auto/status")
+async def read_auto_submission_status() -> Dict[str, Any]:
+    status = store.read_value(AUTO_SUBMISSION_STATUS_KEY)
+    return {"ok": True, "status": status if isinstance(status, dict) else {"state": "idle"}}
+
+
+@app.post("/api/submission/auto/scan")
+async def trigger_auto_submission_scan() -> Dict[str, Any]:
+    try:
+        return await run_auto_submission_scan()
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 def _channel_owner_candidates() -> List[int]:

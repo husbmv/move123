@@ -2,8 +2,8 @@
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useGlobalState } from "@/composables/useGlobalState";
-import { submissionApi } from "@/api";
-import type { SubmissionConfig, SubmissionDraft } from "@/api/types";
+import { pan115HelperApi, submissionApi } from "@/api";
+import type { AutoSubmissionConfig, AutoSubmissionStatus, Pan123BrowseItem, SubmissionConfig, SubmissionDraft } from "@/api/types";
 import { parseIds } from "@/utils/format";
 import PageHero from "@/components/PageHero.vue";
 import GlassCard from "@/components/GlassCard.vue";
@@ -17,14 +17,15 @@ const router = useRouter();
 const { state, writeSubmissionConfig, notifySuccess, notifyError, confirm, loadStatus } = useGlobalState();
 
 // 「机器人」= Bot 连接/权限/草稿；「频道路由」= 各频道主账号的分发规则
-type SubmissionTab = "bot" | "routing";
+type SubmissionTab = "bot" | "routing" | "auto";
 const tabsList = [
   { key: "bot", label: "机器人", icon: "mdi-robot" },
   { key: "routing", label: "频道路由", icon: "mdi-routes" },
+  { key: "auto", label: "自动投稿", icon: "mdi-send-clock" },
 ];
 
 function tabFromQuery(): SubmissionTab {
-  return route.query.tab === "routing" ? "routing" : "bot";
+  return route.query.tab === "routing" ? "routing" : route.query.tab === "auto" ? "auto" : "bot";
 }
 const tab = ref<SubmissionTab>(tabFromQuery());
 watch(
@@ -35,8 +36,8 @@ watch(
   },
 );
 watch(tab, (next) => {
-  const target = next === "routing" ? { query: { tab: "routing" } } : { query: {} };
-  if (route.query.tab !== (next === "routing" ? "routing" : undefined)) {
+  const target = next !== "bot" ? { query: { tab: next } } : { query: {} };
+  if (route.query.tab !== (next !== "bot" ? next : undefined)) {
     router.replace({ path: "/admin/submission", ...target });
   }
 });
@@ -58,6 +59,88 @@ const loadingDrafts = ref(false);
 const saving = ref(false);
 const saveFeedback = ref("");
 const saveFailed = ref(false);
+const autoConfig = reactive<AutoSubmissionConfig>({ enabled: false, rootDirId: "0", rootDirPath: "", mode: "fastlink", ownerUserId: 0, intervalSec: 300 });
+const autoStatus = ref<AutoSubmissionStatus>({});
+const autoSaving = ref(false);
+const autoScanning = ref(false);
+const autoPickerOpen = ref(false);
+const autoPickerLoading = ref(false);
+const autoPickerItems = ref<Pan123BrowseItem[]>([]);
+const autoPickerStack = ref<{ id: number; name: string }[]>([{ id: 0, name: "根目录" }]);
+const autoCurrentDir = computed(() => autoPickerStack.value[autoPickerStack.value.length - 1]);
+
+async function loadAuto() {
+  try {
+    const [config, status] = await Promise.all([submissionApi.autoConfig(), submissionApi.autoStatus()]);
+    Object.assign(autoConfig, config.config);
+    autoStatus.value = status.status || {};
+  } catch (error) {
+    notifyError("自动投稿配置读取失败：" + errorMessage(error));
+  }
+}
+
+async function loadAutoDir(id: number) {
+  autoPickerLoading.value = true;
+  try {
+    const data = await pan115HelperApi.pan123Browse(id);
+    autoPickerItems.value = data.directories || [];
+  } catch (error) {
+    notifyError("123 目录读取失败：" + errorMessage(error));
+  } finally {
+    autoPickerLoading.value = false;
+  }
+}
+
+async function openAutoPicker() {
+  autoPickerStack.value = [{ id: 0, name: "根目录" }];
+  autoPickerOpen.value = true;
+  await loadAutoDir(0);
+}
+
+async function enterAutoDir(item: Pan123BrowseItem) {
+  autoPickerStack.value.push({ id: item.fileId, name: item.name });
+  await loadAutoDir(item.fileId);
+}
+
+async function backAutoDir() {
+  if (autoPickerStack.value.length <= 1) return;
+  autoPickerStack.value.pop();
+  await loadAutoDir(autoCurrentDir.value.id);
+}
+
+function selectAutoDir() {
+  autoConfig.rootDirId = String(autoCurrentDir.value.id);
+  autoConfig.rootDirPath = autoPickerStack.value.map((item) => item.name).join(" / ");
+  autoPickerOpen.value = false;
+}
+
+async function saveAuto() {
+  autoSaving.value = true;
+  try {
+    const data = await submissionApi.putAutoConfig({ ...autoConfig });
+    Object.assign(autoConfig, data.config);
+    notifySuccess("自动投稿配置已保存");
+  } catch (error) {
+    notifyError("自动投稿保存失败：" + errorMessage(error));
+  } finally {
+    autoSaving.value = false;
+  }
+}
+
+async function scanAuto() {
+  autoScanning.value = true;
+  try {
+    const saved = await submissionApi.putAutoConfig({ ...autoConfig });
+    Object.assign(autoConfig, saved.config);
+    const data = await submissionApi.autoScan();
+    autoStatus.value = data.status;
+    notifySuccess("扫描完成：发布 " + (data.status.published || 0) + " 条，跳过 " + (data.status.skipped || 0) + " 条");
+  } catch (error) {
+    notifyError("自动投稿扫描失败：" + errorMessage(error));
+  } finally {
+    autoScanning.value = false;
+  }
+}
 
 const submissionStatus = computed(() => state.submissionStatus);
 
@@ -326,6 +409,7 @@ async function verifyTelegramLogin() {
 
 onMounted(() => {
   refreshDrafts();
+  void loadAuto();
 });
 </script>
 
@@ -588,6 +672,58 @@ onMounted(() => {
     </div>
 
     <SubmissionRoutingPanel v-show="tab === 'routing'" />
+
+    <div v-show="tab === 'auto'" class="section-grid">
+      <GlassCard accent="group" icon="mdi-send-clock" title="123 目录自动投稿"
+        desc="扫描所选目录：每个直属文件夹发一条帖（含其子目录文件），直属文件单独发帖。按频道路由直接发布；失败项下次扫描重试。"
+        :span="2">
+        <FormGrid>
+          <FormField label="监控的 123 网盘目录" hint="从目录树选择，不用输入数字 ID。">
+            <div class="tg-login-row">
+              <v-text-field :model-value="autoConfig.rootDirPath || '根目录'" readonly variant="outlined" density="compact" hide-details />
+              <v-btn variant="outlined" @click="openAutoPicker">选择文件夹</v-btn>
+            </div>
+          </FormField>
+          <FormField label="投稿方式">
+            <v-select v-model="autoConfig.mode" :items="[{title:'秒传链接', value:'fastlink'}, {title:'123 分享链接', value:'share'}]" variant="outlined" density="compact" hide-details />
+          </FormField>
+          <FormField label="频道所有者 UID" hint="填已配置频道路由的 Telegram UID；留 0 则使用首位频道所有者。">
+            <v-text-field v-model.number="autoConfig.ownerUserId" type="number" min="0" variant="outlined" density="compact" hide-details />
+          </FormField>
+          <FormField label="扫描间隔（秒）" hint="60–3600 秒；同一内容不会重复发帖。">
+            <v-text-field v-model.number="autoConfig.intervalSec" type="number" min="60" max="3600" variant="outlined" density="compact" hide-details />
+          </FormField>
+          <FormField label="自动运行">
+            <v-switch v-model="autoConfig.enabled" label="启用定时扫描并自动发布" color="primary" hide-details />
+          </FormField>
+        </FormGrid>
+        <div class="tg-login-row" style="margin-top: 16px">
+          <v-btn color="primary" :loading="autoSaving" @click="saveAuto">保存自动投稿</v-btn>
+          <v-btn variant="outlined" :loading="autoScanning" @click="scanAuto">立即扫描并发布</v-btn>
+          <v-btn variant="text" @click="loadAuto">刷新状态</v-btn>
+        </div>
+        <div class="status-line">{{ autoStatus.state || '尚未扫描' }} · 扫描 {{ autoStatus.scanned || 0 }} 项 · 发布 {{ autoStatus.published || 0 }} · 跳过 {{ autoStatus.skipped || 0 }} · 失败 {{ autoStatus.failed || 0 }}<br v-if="autoStatus.error" />{{ autoStatus.error || '' }}</div>
+        <v-alert type="warning" variant="tonal" density="compact" style="margin-top: 12px">
+          分享模式会在 123 网盘创建永久分享；秒传模式会在网盘「自动投稿秒传种子」目录保存文件夹清单。首次扫描会处理所选目录现有内容，请先确认频道路由和 Bot 管理员权限。
+        </v-alert>
+      </GlassCard>
+    </div>
+
+    <v-dialog v-model="autoPickerOpen" max-width="600" scrollable>
+      <v-card>
+        <v-card-title>选择自动投稿目录</v-card-title>
+        <v-card-subtitle>{{ autoPickerStack.map((item) => item.name).join(' / ') }}</v-card-subtitle>
+        <v-card-text>
+          <v-progress-linear v-if="autoPickerLoading" indeterminate />
+          <v-list v-else>
+            <v-list-item v-if="autoPickerStack.length > 1" title="返回上级" prepend-icon="mdi-arrow-up" @click="backAutoDir" />
+            <v-list-item v-for="item in autoPickerItems" :key="item.fileId" :title="item.name" prepend-icon="mdi-folder" @click="enterAutoDir(item)" />
+            <div v-if="!autoPickerItems.length" class="muted-line">此目录没有子文件夹</div>
+          </v-list>
+        </v-card-text>
+        <v-card-actions><v-spacer /><v-btn variant="text" @click="autoPickerOpen = false">取消</v-btn><v-btn color="primary" @click="selectAutoDir">选择当前目录</v-btn></v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 

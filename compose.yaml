@@ -7,6 +7,8 @@ services:
       - "12315:12315"
     environment:
       TZ: Asia/Shanghai
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
       TG_PROXY_URL: ${TG_PROXY_URL:-}
       TMDB_PROXY_URL: ${TMDB_PROXY_URL:-}
     volumes:

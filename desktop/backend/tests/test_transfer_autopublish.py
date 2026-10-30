@@ -4,7 +4,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app import main
-from app.transfer_autopublish import file_fastlink, publishable_files, render_reference_caption
+from app.transfer_autopublish import file_fastlink, publishable_files
+from app.submission import render_submission_caption
 from app.session_store import SessionStore
 from app.transfer_service import TransferService
 
@@ -24,9 +25,9 @@ class AutoPublishTests(__import__("unittest").TestCase):
     assert parsed["files"][0]["size"] == 123
     assert parsed["files"][0]["path"] == "Episode.mkv"
     assert publishable_files(_task("partial")) == []
-    caption = render_reference_caption({"media": {"title": "测试影片", "year": "2026", "tmdbId": 42, "overview": "简介", "genres": ["动作"]}, "metadata": {}}, "Episode.mkv", "123 B", link)
-    assert "🏷️ 标签" in caption and "🆔 TMDB：42" in caption
-    assert "🔗 分享链接" in caption and link in caption
+    caption = render_submission_caption({"share": {"cleanUrl": link}, "shareDisplayFastlink": True, "media": {"title": "测试影片", "year": "2026", "tmdbId": 42, "overview": "简介", "genres": ["动作"]}, "metadata": {}}, {"templates": {"caption": "🎬 {title}\n👤 分享：{shareLink}"}})
+    assert "测试影片" in caption and link in caption
+    assert "<code>" in caption
 
  def test_completed_transfer_uses_existing_submission_publisher_without_duplicate(self):
     class Store:

@@ -56,6 +56,29 @@ class InMemoryOauthStore:
 
 
 class Pan123ShareClientTests(unittest.TestCase):
+    def test_openapi_create_share(self):
+        client = Pan123OpenAPIClient(oauth_store=InMemoryOauthStore())
+        client.request = AsyncMock(return_value={"data": {"shareKey": "abc-123"}})
+        url = asyncio.run(client.create_share(123, "测试"))
+        self.assertEqual(url, "https://www.123pan.com/s/abc-123")
+        self.assertEqual(client.request.await_args.kwargs["json"], {
+            "shareName": "测试", "shareExpire": 0, "fileIDList": "123",
+        })
+
+    def test_openapi_upload_text_seed(self):
+        client = Pan123OpenAPIClient(oauth_store=InMemoryOauthStore())
+        client.request = AsyncMock(return_value={"data": ["https://upload.example.com"]})
+        client.get_token = AsyncMock(return_value="test-token")
+        response = httpx.Response(200, json={"code": 0, "data": {"fileID": 321, "completed": True}})
+        write_client = AsyncMock()
+        write_client.post.return_value = response
+        client._http.write = lambda: write_client
+        result = asyncio.run(client.upload_text_file("42", "seed.json", "{}"))
+        self.assertEqual(result["fileId"], 321)
+        self.assertEqual(result["size"], 2)
+        self.assertEqual(write_client.post.await_args.args[0], "https://upload.example.com/upload/v2/file/single/create")
+        self.assertEqual(write_client.post.await_args.kwargs["data"]["parentFileID"], "42")
+
     def test_share_url_parser_supports_official_paths_and_rejects_external_hosts(self):
         cases = {
             "https://www.123pan.com/s/abc_DEF?pwd=ABCD": "abc_DEF",

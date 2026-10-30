@@ -2259,6 +2259,11 @@ def render_rating(value: Any, url: str = "") -> str:
 
 
 def render_share_link(draft: Dict[str, Any], config: Dict[str, Any]) -> str:
+    if draft.get("shareDisplayFastlink"):
+        share = draft.get("share") if isinstance(draft.get("share"), dict) else {}
+        link = str(share.get("cleanUrl") or share.get("url") or "").strip()
+        if link.startswith(("123FLCPV2$", "123FSLinkV2$")):
+            return f"<code>{escape(link)}</code>"
     templates = config.get("templates") if isinstance(config.get("templates"), dict) else {}
     name = escape(submission_share_name(draft, config))
     # A collaborator is attributed to their Telegram profile, not to the
@@ -2272,7 +2277,7 @@ def render_share_link(draft: Dict[str, Any], config: Dict[str, Any]) -> str:
 def render_share_url_value(draft: Dict[str, Any]) -> str:
     share = draft.get("share") if isinstance(draft.get("share"), dict) else {}
     clean_url = str(share.get("cleanUrl") or share.get("url") or "").strip()
-    if clean_url.startswith("123FLCPV2$") or re.match(r"^https?://", clean_url, re.I):
+    if clean_url.startswith(("123FLCPV2$", "123FSLinkV2$")) or re.match(r"^https?://", clean_url, re.I):
         return clean_url
     return ""
 
@@ -2778,7 +2783,7 @@ def build_submission_preview_markup(draft: Dict[str, Any], config: Dict[str, Any
         return None
     provider = str(share.get("provider") or "")
     rows: List[List[Dict[str, Any]]] = []
-    if provider == "123fastlink" and clean_url.startswith("123FLCPV2$"):
+    if provider == "123fastlink" and clean_url.startswith(("123FLCPV2$", "123FSLinkV2$")):
         # copy_text 按钮文本上限 256 字符。脚本直投推来的是二级链接种子（单条记录，
         # 必不超限）；超长的普通秒传链接发不了复制按钮，频道也不再附带秒传 JSON 文件。
         if len(clean_url) <= 256:
@@ -3825,6 +3830,7 @@ def normalize_submission_draft(value: Dict[str, Any]) -> Dict[str, Any]:
         "share": value.get("share") if isinstance(value.get("share"), dict) else {},
         "inspection": value.get("inspection") if isinstance(value.get("inspection"), dict) else {},
         **({"autoPublishCaption": value["autoPublishCaption"]} if isinstance(value.get("autoPublishCaption"), str) and value.get("autoPublishCaption") else {}),
+        **({"shareDisplayFastlink": True} if value.get("shareDisplayFastlink") else {}),
         "documents": normalize_submission_documents(value.get("documents") or []),
         **({"databaseNote": database_note} if database_note else {}),
     }

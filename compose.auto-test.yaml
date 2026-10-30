@@ -1,0 +1,25 @@
+# 本地验收专用：先 docker load -i move123-amd64-auto-submission-test.tar.gz
+services:
+  cloud123:
+    image: move123:auto-submission-test
+    platform: linux/amd64
+    container_name: cloud123-auto-test
+    restart: unless-stopped
+    ports:
+      - "12315:12315"
+    environment:
+      TZ: Asia/Shanghai
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TG_PROXY_URL: ${TG_PROXY_URL:-}
+      TMDB_PROXY_URL: ${TMDB_PROXY_URL:-}
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:12315/api/web-auth/state', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import time
@@ -485,6 +486,57 @@ class Pan123OpenAPIClient:
                 break
             last_file_id = next_file_id
         return files
+
+    async def create_share(self, file_id: int, name: str) -> str:
+        """Create a permanent, password-free share for one own-cloud entry."""
+        if int(file_id) <= 0:
+            raise Pan123Error("分享文件 ID 无效")
+        data = await self.request(
+            "POST",
+            "/api/v1/share/create",
+            json={
+                "shareName": str(name or file_id),
+                "shareExpire": 0,
+                "fileIDList": str(int(file_id)),
+            },
+        )
+        body = data.get("data") if isinstance(data.get("data"), dict) else {}
+        share_key = string_value(body.get("shareKey"), body.get("ShareKey"))
+        if not share_key:
+            raise Pan123Error("123 创建分享未返回分享码")
+        return f"https://www.123pan.com/s/{share_key}"
+
+    async def upload_text_file(self, parent_file_id: str, filename: str, content: str) -> Dict[str, Any]:
+        """Upload a small UTF-8 fastlink seed via the official single-step API."""
+        raw = content.encode("utf-8")
+        if not raw or len(raw) > 1024 * 1024:
+            raise Pan123Error("秒传种子文件必须在 1 MB 以内")
+        domain_data = await self.request("GET", "/upload/v2/file/domain")
+        domains = domain_data.get("data")
+        if isinstance(domains, dict):
+            domains = domains.get("data") or domains.get("domains") or domains.get("list")
+        if not isinstance(domains, list) or not domains:
+            raise Pan123Error("123 未返回可用上传域名")
+        domain = str(domains[0]).strip().rstrip("/")
+        if not domain.startswith("https://"):
+            raise Pan123Error("123 返回的上传域名不是 HTTPS")
+        if not re.fullmatch(r"https://[A-Za-z0-9.-]+", domain):
+            raise Pan123Error("123 返回的上传域名无效")
+        etag = hashlib.md5(raw).hexdigest()
+        headers = {"Authorization": "Bearer " + await self.get_token(), "platform": "open_platform"}
+        response = await self._http.write().post(
+            domain + "/upload/v2/file/single/create",
+            headers=headers,
+            data={"parentFileID": str(int(parent_file_id or "0")), "filename": filename, "etag": etag, "size": str(len(raw))},
+            files={"file": (filename, raw, "application/json")},
+            timeout=max(60.0, self.timeout),
+        )
+        payload = safe_json(response)
+        body = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        file_id = number_value(body.get("fileID"), body.get("fileId"))
+        if response.status_code >= 400 or payload.get("code") not in (0, "0", None) or not file_id or body.get("completed") is not True:
+            raise Pan123Error(string_value(payload.get("message")) or "123 上传秒传种子失败")
+        return {"fileId": file_id, "etag": etag, "size": len(raw), "name": filename}
 
     async def rename_file(self, file_id: int, filename: str) -> None:
         await self.request("POST", "/api/v1/file/rename", json={"renameList": [f"{int(file_id)}|{filename}"]})

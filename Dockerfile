@@ -12,7 +12,9 @@ COPY desktop/backend/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt && useradd -r -u 10001 -m cloud123 && mkdir /data && chown cloud123:cloud123 /data
 COPY desktop/backend/ /app/desktop/backend/
 COPY --from=web /build/dist /app/desktop/web/dist
-USER cloud123
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 WORKDIR /app/desktop/backend
 EXPOSE 12315
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python", "-m", "app"]

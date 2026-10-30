@@ -306,6 +306,26 @@ export interface SubmissionConfig {
   updatedAt?: string;
 }
 
+export interface AutoSubmissionConfig {
+  enabled: boolean;
+  rootDirId: string;
+  rootDirPath: string;
+  mode: "fastlink" | "share";
+  ownerUserId: number;
+  intervalSec: number;
+}
+
+export interface AutoSubmissionStatus {
+  state?: string;
+  rootDirId?: string;
+  scanned?: number;
+  published?: number;
+  skipped?: number;
+  failed?: number;
+  error?: string;
+  updatedAt?: string;
+}
+
 export interface SubmissionStatus {
   ok: boolean;
   botConfigured: boolean;
